@@ -1,0 +1,2511 @@
+diff --git a/.gitignore b/.gitignore
+index d1a8ab3f98aa..7e7db3fb9266 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -169,3 +169,8 @@ sphinx_*/
+ 
+ # Rust analyzer configuration
+ /rust-project.json
++arch/arm64/configs/zest.fragment
++include/linux/zest.h
++mm/zest
++fs/f2fs/zest_f2fs.c
++block/blk-zone-wplug.c
+\ No newline at end of file
+diff --git a/BUILD.bazel b/BUILD.bazel
+index 92a4aca3c354..0f7ed4b361dd 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -157,6 +157,7 @@ define_common_kernels(target_configs = {
+         "module_implicit_outs": get_gki_modules_list("arm64") + get_kunit_modules_list("arm64"),
+         "make_goals": _GKI_AARCH64_MAKE_GOALS,
+         "ddk_headers_archive": ":kernel_aarch64_ddk_headers_archive",
++        "defconfig_fragments": ["arch/arm64/configs/zest.fragment"],   # zest1
+         "extra_dist": [
+             ":test_mappings_zip",
+             ":tests_zip_arm64",
+diff --git a/block/Kconfig b/block/Kconfig
+index f1364d1c0d93..66f007331463 100644
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -88,6 +88,24 @@ config BLK_DEV_ZONED
+ 
+ 	Say yes here if you have a ZAC, ZBC, or ZNS storage device.
+ 
++# zest1: backport of upstream zone write plugging (6.10+) gated behind a
++# compile-time switch. When disabled, the kernel uses the original 6.6
++# zone write locking path (no behavioral change). When enabled, sequential
++# write ordering is done at the bio layer (no scheduler tag occupation) and
++# the zoned device no longer requires the mq-deadline scheduler.
++config BLK_ZONE_WRITE_PLUGGING
++	bool "Zone write plugging (backport)"
++	default n
++	depends on BLK_DEV_ZONED
++	help
++	  Backport of the upstream zone write plugging mechanism. Sequential
++	  write ordering for zoned block devices is performed at the bio level
++	  instead of via per-zone write locking in the I/O scheduler. Plugged
++	  write bios do not hold scheduler tags, which avoids tag-quota
++	  contention and removes the dependency on the mq-deadline scheduler.
++
++	  If unsure, say N (the original zone write locking path is used).
++
+ config BLK_DEV_THROTTLING
+ 	bool "Block layer bio throttling support"
+ 	depends on BLK_CGROUP
+diff --git a/block/Makefile b/block/Makefile
+index 46ada9dc8bbf..e54a774c38dc 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -31,6 +31,7 @@ obj-$(CONFIG_BLK_DEV_INTEGRITY_T10)	+= t10-pi.o
+ obj-$(CONFIG_BLK_MQ_PCI)	+= blk-mq-pci.o
+ obj-$(CONFIG_BLK_MQ_VIRTIO)	+= blk-mq-virtio.o
+ obj-$(CONFIG_BLK_DEV_ZONED)	+= blk-zoned.o
++obj-$(CONFIG_BLK_ZONE_WRITE_PLUGGING)	+= blk-zone-wplug.o	# zest1
+ obj-$(CONFIG_BLK_WBT)		+= blk-wbt.o
+ obj-$(CONFIG_BLK_DEBUG_FS)	+= blk-mq-debugfs.o
+ obj-$(CONFIG_BLK_DEBUG_FS_ZONED)+= blk-mq-debugfs-zoned.o
+diff --git a/block/bio.c b/block/bio.c
+index ab418bb7be2c..298a3313ca9a 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1590,6 +1590,10 @@ void bio_endio(struct bio *bio)
+ 	if (!bio_integrity_endio(bio))
+ 		return;
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	blk_zone_bio_endio(bio);
++#endif
++
+ 	rq_qos_done_bio(bio);
+ 
+ 	if (bio->bi_bdev && bio_flagged(bio, BIO_TRACE_COMPLETION)) {
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 98aedb704338..24ba4fa45749 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -990,14 +990,22 @@ static void blk_account_io_merge_bio(struct request *req)
+ 	part_stat_unlock();
+ }
+ 
++#ifndef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1: moved to blk.h when ZWP on */
+ enum bio_merge_status {
+ 	BIO_MERGE_OK,
+ 	BIO_MERGE_NONE,
+ 	BIO_MERGE_FAILED,
+ };
++#endif
+ 
++/* zest1: zone write plugging needs to call this from blk-zoned.c */
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING
++enum bio_merge_status bio_attempt_back_merge(struct request *req,
++		struct bio *bio, unsigned int nr_segs)
++#else
+ static enum bio_merge_status bio_attempt_back_merge(struct request *req,
+ 		struct bio *bio, unsigned int nr_segs)
++#endif
+ {
+ 	const blk_opf_t ff = bio_failfast(bio);
+ 
+@@ -1012,6 +1020,11 @@ static enum bio_merge_status bio_attempt_back_merge(struct request *req,
+ 
+ 	blk_update_mixed_merge(req, bio, false);
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	if (req->rq_flags & RQF_ZONE_WRITE_PLUGGING)
++		blk_zone_write_plug_bio_merged(bio);
++#endif
++
+ 	req->biotail->bi_next = bio;
+ 	req->biotail = bio;
+ 	req->__data_len += bio->bi_iter.bi_size;
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 5649c9e3719d..6eef8ac0ed72 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -161,6 +161,9 @@ static const struct blk_mq_debugfs_attr blk_mq_debugfs_queue_attrs[] = {
+ 	{ "pm_only", 0600, queue_pm_only_show, NULL },
+ 	{ "state", 0600, queue_state_show, queue_state_write },
+ 	{ "zone_wlock", 0400, queue_zone_wlock_show, NULL },
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	{ "zone_wplugs", 0400, queue_zone_wplugs_show, NULL },
++#endif
+ 	{ },
+ };
+ 
+diff --git a/block/blk-mq-debugfs.h b/block/blk-mq-debugfs.h
+index 7942119051f5..0aed15dc4185 100644
+--- a/block/blk-mq-debugfs.h
++++ b/block/blk-mq-debugfs.h
+@@ -98,4 +98,14 @@ static inline int queue_zone_wlock_show(void *data, struct seq_file *m)
+ }
+ #endif
+ 
++/* zest1: zone write plugging debugfs */
++#if defined(CONFIG_BLK_ZONE_WRITE_PLUGGING) && defined(CONFIG_BLK_DEBUG_FS)
++int queue_zone_wplugs_show(void *data, struct seq_file *m);
++#else
++static inline int queue_zone_wplugs_show(void *data, struct seq_file *m)
++{
++	return 0;
++}
++#endif
++
+ #endif
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 12eee9e1382c..621549ad2157 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -690,6 +690,10 @@ static void blk_mq_finish_request(struct request *rq)
+ {
+ 	struct request_queue *q = rq->q;
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	blk_zone_finish_request(rq);
++#endif
++
+ 	if (rq->rq_flags & RQF_USE_SCHED) {
+ 		q->elevator->type->ops.finish_request(rq);
+ 		/*
+@@ -3034,6 +3038,20 @@ void blk_mq_submit_bio(struct bio *bio)
+ 
+ 	trace_android_vh_check_set_ioprio(bio);
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	/*
++	 * A BIO that was released from a zone write plug has already been
++	 * through the preparation in this function, already holds a reference
++	 * on the queue usage counter, and is the only write BIO in-flight for
++	 * the target zone. Go straight to preparing a request for it.
++	 */
++	if (bio_zone_write_plugging(bio)) {
++		/* The segment count was stashed in the poll cookie at plug time. */
++		nr_segs = bio->bi_cookie;
++		goto zwp_new_request;
++	}
++#endif
++
+ 	bio = blk_queue_bounce(bio, q);
+ 
+ 	if (plug) {
+@@ -3053,6 +3071,16 @@ void blk_mq_submit_bio(struct bio *bio)
+ 			return;
+ 		if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
+ 			return;
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++		/*
++		 * Plug zoned writes before deciding to use a cached request, so
++		 * that sequential write ordering is preserved. The cached
++		 * request keeps its own queue usage reference, so nothing to
++		 * release here if the BIO is plugged.
++		 */
++		if (blk_queue_is_zoned(q) && blk_zone_plug_bio(bio, nr_segs))
++			return;
++#endif
+ 		if (blk_mq_can_use_cached_rq(rq, plug, bio))
+ 			goto done;
+ 		percpu_ref_get(&q->q_usage_counter);
+@@ -3070,6 +3098,17 @@ void blk_mq_submit_bio(struct bio *bio)
+ 			goto fail;
+ 	}
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	/*
++	 * Plug zoned writes. If the BIO is plugged, drop the queue usage
++	 * reference held by this submission path (the plug took its own).
++	 */
++	if (blk_queue_is_zoned(q) && blk_zone_plug_bio(bio, nr_segs)) {
++		blk_queue_exit(q);
++		return;
++	}
++zwp_new_request:
++#endif
+ 	rq = blk_mq_get_new_requests(q, plug, bio, nr_segs);
+ 	if (unlikely(!rq)) {
+ fail:
+@@ -3092,6 +3131,11 @@ void blk_mq_submit_bio(struct bio *bio)
+ 		return;
+ 	}
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	if (bio_zone_write_plugging(bio))
++		blk_zone_write_plug_init_request(rq);
++#endif
++
+ 	if (op_is_flush(bio->bi_opf) && blk_insert_flush(rq))
+ 		return;
+ 
+diff --git a/block/blk-zoned.c b/block/blk-zoned.c
+index 9a5ca71c5b13..50398f495a18 100644
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@ -152,6 +152,16 @@ int blkdev_report_zones(struct block_device *bdev, sector_t sector,
+ 	if (!nr_zones || sector >= capacity)
+ 		return 0;
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	/*
++	 * When zone write plugging is active, route the report through the
++	 * plugging layer so that zone write pointer offsets are resynced.
++	 */
++	if (blk_zone_wplug_active(disk))
++		return blk_zone_wplug_report_zones(disk, sector, nr_zones,
++						   cb, data);
++#endif
++
+ 	return disk->fops->report_zones(disk, sector, nr_zones, cb, data);
+ }
+ EXPORT_SYMBOL_GPL(blkdev_report_zones);
+@@ -440,6 +450,9 @@ void disk_free_zone_bitmaps(struct gendisk *disk)
+ 	disk->conv_zones_bitmap = NULL;
+ 	kfree(disk->seq_zones_wlock);
+ 	disk->seq_zones_wlock = NULL;
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1: also free zone write plug resources */
++	disk_free_zone_resources(disk);
++#endif
+ }
+ 
+ struct blk_revalidate_zone_args {
+@@ -569,6 +582,11 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
+ 	unsigned int noio_flag;
+ 	int ret;
+ 
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	/* Zone write plugging uses its own resource (re)allocation path. */
++	return blk_zone_wplug_revalidate_disk_zones(disk, update_driver_data);
++#endif
++
+ 	if (WARN_ON_ONCE(!blk_queue_is_zoned(q)))
+ 		return -EIO;
+ 	if (WARN_ON_ONCE(!queue_is_mq(q)))
+diff --git a/block/blk.h b/block/blk.h
+index 32cede9a66f9..7980d23129fb 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -443,6 +443,104 @@ static inline int blkdev_zone_mgmt_ioctl(struct block_device *bdev,
+ }
+ #endif /* CONFIG_BLK_DEV_ZONED */
+ 
++/* zest1: zone write plugging (backport). See block/blk-zoned.c. */
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING
++/* Moved here (from blk-merge.c) so blk-zoned.c can merge plugged bios. */
++enum bio_merge_status {
++	BIO_MERGE_OK,
++	BIO_MERGE_NONE,
++	BIO_MERGE_FAILED,
++};
++enum bio_merge_status bio_attempt_back_merge(struct request *req,
++		struct bio *bio, unsigned int nr_segs);
++
++bool blk_zone_plug_bio(struct bio *bio, unsigned int nr_segs);
++
++static inline bool bio_zone_write_plugging(struct bio *bio)
++{
++	return bio_flagged(bio, BIO_ZONE_WRITE_PLUGGING);
++}
++
++void blk_zone_write_plug_bio_merged(struct bio *bio);
++void blk_zone_write_plug_init_request(struct request *rq);
++
++static inline void blk_zone_update_request_bio(struct request *rq,
++					       struct bio *bio)
++{
++	/*
++	 * For zone append requests, the request sector indicates the location
++	 * at which the BIO data was written. Return this value to the BIO
++	 * issuer through the BIO iter sector. For plugged zone writes, which
++	 * include emulated zone append, we need to ensure that the BIO issuer
++	 * sees the correct write position.
++	 */
++	if (req_op(rq) == REQ_OP_ZONE_APPEND || bio_zone_write_plugging(bio))
++		bio->bi_iter.bi_sector = rq->__sector;
++}
++
++void blk_zone_write_plug_bio_endio(struct bio *bio);
++static inline void blk_zone_bio_endio(struct bio *bio)
++{
++	/*
++	 * For write BIOs to zoned devices, signal the completion of the BIO so
++	 * that the next plugged BIO can be submitted via zone write plugging.
++	 */
++	if (bio_zone_write_plugging(bio))
++		blk_zone_write_plug_bio_endio(bio);
++}
++
++void blk_zone_write_plug_finish_request(struct request *rq);
++static inline void blk_zone_finish_request(struct request *rq)
++{
++	if (rq->rq_flags & RQF_ZONE_WRITE_PLUGGING)
++		blk_zone_write_plug_finish_request(rq);
++}
++
++void disk_init_zone_resources(struct gendisk *disk);
++void disk_free_zone_resources(struct gendisk *disk);
++
++/* Entry points called from blk-zoned.c thin #ifdef hooks. */
++bool blk_zone_wplug_active(struct gendisk *disk);
++int blk_zone_wplug_report_zones(struct gendisk *disk, sector_t sector,
++				unsigned int nr_zones, report_zones_cb cb,
++				void *data);
++int blk_zone_wplug_revalidate_disk_zones(struct gendisk *disk,
++			void (*update_driver_data)(struct gendisk *disk));
++#else /* CONFIG_BLK_ZONE_WRITE_PLUGGING */
++static inline bool blk_zone_plug_bio(struct bio *bio, unsigned int nr_segs)
++{
++	return false;
++}
++static inline bool bio_zone_write_plugging(struct bio *bio)
++{
++	return false;
++}
++static inline void blk_zone_write_plug_bio_merged(struct bio *bio)
++{
++}
++static inline void blk_zone_write_plug_init_request(struct request *rq)
++{
++}
++static inline void blk_zone_update_request_bio(struct request *rq,
++					       struct bio *bio)
++{
++	if (req_op(rq) == REQ_OP_ZONE_APPEND)
++		bio->bi_iter.bi_sector = rq->__sector;
++}
++static inline void blk_zone_bio_endio(struct bio *bio)
++{
++}
++static inline void blk_zone_finish_request(struct request *rq)
++{
++}
++static inline void disk_init_zone_resources(struct gendisk *disk)
++{
++}
++static inline void disk_free_zone_resources(struct gendisk *disk)
++{
++}
++#endif /* CONFIG_BLK_ZONE_WRITE_PLUGGING */
++
+ struct block_device *bdev_alloc(struct gendisk *disk, u8 partno);
+ void bdev_add(struct block_device *bdev, dev_t dev);
+ 
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index b0e8dd387bb1..85adf625fc6f 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1234,11 +1234,13 @@ static blk_status_t sd_setup_read_write_cmnd(struct scsi_cmnd *cmd)
+ 		}
+ 	}
+ 
++#ifndef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1: ZWP emulates zone append at the block layer */
+ 	if (req_op(rq) == REQ_OP_ZONE_APPEND) {
+ 		ret = sd_zbc_prepare_zone_append(cmd, &lba, nr_blocks);
+ 		if (ret)
+ 			goto fail;
+ 	}
++#endif
+ 
+ 	fua = rq->cmd_flags & REQ_FUA ? 0x8 : 0;
+ 	dix = scsi_prot_sg_count(cmd);
+diff --git a/drivers/scsi/sd_zbc.c b/drivers/scsi/sd_zbc.c
+index 13bd09139824..f021fa13eb82 100644
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@ -876,8 +876,16 @@ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp)
+ 
+ 	blk_queue_chunk_sectors(q,
+ 			logical_to_sectors(sdkp->device, zone_blocks));
++#ifndef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
+ 	blk_queue_max_zone_append_sectors(q,
+ 			q->limits.max_segments << PAGE_SECTORS_SHIFT);
++#else
++	/*
++	 * Leave max_zone_append_sectors at 0 so that the block layer handles
++	 * zone append via zone write plugging (emulation) instead of the
++	 * driver. UFS has no native zone append command.
++	 */
++#endif
+ 
+ 	ret = blk_revalidate_disk_zones(disk, sd_zbc_revalidate_zones_cb);
+ 
+@@ -954,7 +962,9 @@ int sd_zbc_read_zones(struct scsi_disk *sdkp, u8 buf[SD_BUF_SIZE])
+ 
+ 	/* The drive satisfies the kernel restrictions: set it up */
+ 	blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
++#ifndef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1: ZWP does not need an I/O scheduler */
+ 	blk_queue_required_elevator_features(q, ELEVATOR_F_ZBD_SEQ_WRITE);
++#endif
+ 	if (sdkp->zones_max_open == U32_MAX)
+ 		disk_set_max_open_zones(disk, 0);
+ 	else
+diff --git a/fs/f2fs/Makefile b/fs/f2fs/Makefile
+index 8a7322d229e4..bca003d53bc3 100644
+--- a/fs/f2fs/Makefile
++++ b/fs/f2fs/Makefile
+@@ -4,6 +4,8 @@ obj-$(CONFIG_F2FS_FS) += f2fs.o
+ f2fs-y		:= dir.o file.o inode.o namei.o hash.o super.o inline.o
+ f2fs-y		+= checkpoint.o gc.o data.o node.o segment.o recovery.o
+ f2fs-y		+= shrinker.o extent_cache.o sysfs.o
++# zest1: cold curseg zone-close + summary helpers
++f2fs-y		+= zest_f2fs.o
+ f2fs-$(CONFIG_F2FS_STAT_FS) += debug.o
+ f2fs-$(CONFIG_F2FS_FS_XATTR) += xattr.o
+ f2fs-$(CONFIG_F2FS_FS_POSIX_ACL) += acl.o
+diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+index ae3c2603a67d..f8e5ff3e64a2 100644
+--- a/fs/f2fs/data.c
++++ b/fs/f2fs/data.c
+@@ -21,6 +21,8 @@
+ #include <linux/sched/signal.h>
+ #include <linux/fiemap.h>
+ #include <linux/iomap.h>
++//zest2: lifecycle hooks for swapon/swapoff takeover
++#include <linux/zest.h>
+ 
+ #include "f2fs.h"
+ #include "node.h"
+@@ -4005,30 +4007,48 @@ static int check_swap_activate(struct swap_info_struct *sis,
+ 		if ((pblock - SM_I(sbi)->main_blkaddr) % blks_per_sec ||
+ 				nr_pblocks % blks_per_sec ||
+ 				!f2fs_valid_pinned_area(sbi, pblock)) {
+-			bool last_extent = false;
+-
+-			not_aligned++;
+-
+-			nr_pblocks = roundup(nr_pblocks, blks_per_sec);
+-			if (cur_lblock + nr_pblocks > sis->max)
+-				nr_pblocks -= blks_per_sec;
++			//zest: under zest_enable skip migration entirely.
++			//pin+fallocate already placed the blocks into the
++			//zoned area via f2fs_allocate_pinning_section, so the
++			//only legitimate misalignment is the swapfile-size
++			//remainder at the tail. f2fs_migrate_blocks would
++			//allocate a fresh zone and write a full section of 
++			//mostly-empty data into it, opening a new IMP_OPEN 
++			//zone AND advancing the COLD_DATA_PINNED
++			//curseg.
++			//We want ZEST controls writes and F2FS curseg
++			//stay untouched. Fall through to add_swap_extent
++			//with the original nr_pblocks;
++			if (sbi->zest_enable) {
++				f2fs_notice(sbi,
++					"zest: skip migration cur_lblock=%u pblock=%u nr_pblocks=%u blks_per_sec=%u",
++					cur_lblock, pblock, nr_pblocks, blks_per_sec);
++			} else {
++				bool last_extent = false;
++
++				not_aligned++;
++
++				nr_pblocks = roundup(nr_pblocks, blks_per_sec);
++				if (cur_lblock + nr_pblocks > sis->max)
++					nr_pblocks -= blks_per_sec;
++
++				/* this extent is last one */
++				if (!nr_pblocks) {
++					nr_pblocks = last_lblock - cur_lblock;
++					last_extent = true;
++				}
+ 
+-			/* this extent is last one */
+-			if (!nr_pblocks) {
+-				nr_pblocks = last_lblock - cur_lblock;
+-				last_extent = true;
+-			}
++				ret = f2fs_migrate_blocks(inode, cur_lblock,
++								nr_pblocks);
++				if (ret) {
++					if (ret == -ENOENT)
++						ret = -EINVAL;
++					goto out;
++				}
+ 
+-			ret = f2fs_migrate_blocks(inode, cur_lblock,
+-							nr_pblocks);
+-			if (ret) {
+-				if (ret == -ENOENT)
+-					ret = -EINVAL;
+-				goto out;
++				if (!last_extent)
++					goto retry;
+ 			}
+-
+-			if (!last_extent)
+-				goto retry;
+ 		}
+ 
+ 		if (cur_lblock + nr_pblocks >= sis->max)
+@@ -4096,18 +4116,62 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
+ 	f2fs_precache_extents(inode);
+ 
+ 	ret = check_swap_activate(sis, file, span);
+-	if (ret < 0)
++	if (ret < 0) {
++		//zest2: hard-fail path. Surface a clear hint so the user
++		//knows the workaround (disable zest_enable then retry).
++		if (sbi->zest_enable && ret == -ENOSPC)
++			f2fs_err(sbi,
++				"zest: swap_activate -ENOSPC under zest_enable=1; zoned device exhausted. Workaround: echo 0 > /sys/fs/f2fs/<bdi>/zest_enable, then retry swapon (will pin to conv).");
++		else if (sbi->zest_enable)
++			f2fs_err(sbi,
++				"zest: swap_activate failed under zest_enable=1 (err=%d). Check zoned dev free space; or disable zest_enable to use conv-area swap.",
++				ret);
+ 		return ret;
++	}
+ 
+ 	stat_inc_swapfile_inode(inode);
+ 	set_inode_flag(inode, FI_PIN_FILE);
+ 	f2fs_update_time(sbi, REQ_TIME);
++
++	//zest2: opt-in takeover. Runs after FI_PIN_FILE is set so the
++	//swap inode is fully in its "pinned" state by the time ZEST starts
++	//touching sis. On failure, unwind FI_PIN_FILE/stat and return; mm
++	//side will call destroy_swap_extents on the bad_swap path -- our
++	//f2fs_swap_deactivate is NOT invoked because SWP_ACTIVATED isn't
++	//set yet (mm/swapfile.c sets it only after this callback returns 0).
++	if (sbi->zest_enable) {
++		int zerr;
++
++		f2fs_notice(sbi,
++			"zest: swap_activate calling zest_init sis=%p nr_extents=%d",
++			sis, ret);
++		zerr = zest_init_for_swapfile(sbi, sis);
++		if (zerr) {
++			f2fs_err(sbi,
++				"zest: zest_init_for_swapfile err=%d; unwinding swap_activate. Workaround: echo 0 > /sys/fs/f2fs/<bdi>/zest_enable, then retry swapon.",
++				zerr);
++			clear_inode_flag(inode, FI_PIN_FILE);
++			stat_dec_swapfile_inode(inode);
++			return zerr;
++		}
++		f2fs_notice(sbi, "zest: swap_activate takeover complete");
++	}
+ 	return ret;
+ }
+ 
+ static void f2fs_swap_deactivate(struct file *file)
+ {
+ 	struct inode *inode = file_inode(file);
++	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
++
++	//zest2: release any zest_info this sbi owns.
++	zest_release_for_swapfile(sbi);
++	
++	if (sbi->zest_enable) {
++		//zest: swapoff returns the filesystem to the default non-ZEST mode.
++		sbi->zest_enable = false;
++		f2fs_notice(sbi, "zest: swapoff auto-disabled zest_enable");
++	}
+ 
+ 	stat_dec_swapfile_inode(inode);
+ 	clear_inode_flag(inode, FI_PIN_FILE);
+diff --git a/fs/f2fs/f2fs.h b/fs/f2fs/f2fs.h
+index 6822b8104a65..ad5ce6e66d1e 100644
+--- a/fs/f2fs/f2fs.h
++++ b/fs/f2fs/f2fs.h
+@@ -1855,6 +1855,33 @@ struct f2fs_sb_info {
+ 	/* For io latency related statistics info in one iostat period */
+ 	spinlock_t iostat_lat_lock;
+ 	struct iostat_lat_info *iostat_io_lat;
++
++	// zest1
++	/* ZEST: per-sb opt-in for this filesystem to participate in ZEST */
++	bool zest_enable;
++	//zest-fiotest: under zest_enable, also force NON-pinned DATA-curseg
++	//allocation onto the zoned device (normally only pinned/swap pins go
++	//zoned). Purpose: let a plain fallocate'd file be FIO-written with
++	//O_DIRECT so we can measure raw zoned-LU write throughput through the
++	//ordinary F2FS data path -- isolating "the zoned LU write BW is just
++	//low" from "ZEST's swap bio path is unoptimized". Test/measurement
++	//knob, default 0. While on it redirects ALL data writes (filesystem
++	//-wide) to zoned, so use it on an otherwise idle device.
++	unsigned int zest_data_zoned;
++	//zest3: over-provisioning ratio (percent of swap-visible capacity) that
++	//ZEST auto-reserves as extra pinned OP zones when a swapfile is
++	//activated. 100 == 1:1 (OP == swap size). Read once at swapon; changing
++	//it afterwards has no effect until the swapfile is recreated.
++	unsigned int zest_op_ratio;
++	//zest-gc: host-FTL garbage collection knobs (live, read by the GC
++	//kthread via f2fs_zest_gc_* accessors). zest_gc_enable gates GC at
++	//runtime (0/1); zest_gc_threshold is the free-zone count below which
++	//GC is triggered; zest_gc_target is the free-zone count GC tops up to
++	//per cycle (>= threshold). unsigned int (not bool) so the generic
++	//sysfs show -- which reads the field as unsigned int -- is correct.
++	unsigned int zest_gc_enable;
++	unsigned int zest_gc_threshold;
++	unsigned int zest_gc_target;
+ #endif
+ };
+ 
+@@ -3856,6 +3883,11 @@ unsigned int f2fs_usable_blks_in_seg(struct f2fs_sb_info *sbi,
+ unsigned long long f2fs_get_section_mtime(struct f2fs_sb_info *sbi,
+ 			unsigned int segno);
+ 
++/* zest1: fs/f2fs/zest_f2fs.c -- cold curseg evacuation + zone summary */
++int f2fs_zest_evacuate_cold_section(struct f2fs_sb_info *sbi);
++int f2fs_zest_zone_summary_emit(struct f2fs_sb_info *sbi,
++				char *buf, size_t size);
++
+ #define DEF_FRAGMENT_SIZE	4
+ #define MIN_FRAGMENT_SIZE	1
+ #define MAX_FRAGMENT_SIZE	512
+@@ -4085,6 +4117,11 @@ struct f2fs_stat_info {
+ 	unsigned int inplace_count;
+ 	unsigned long long base_mem, cache_mem, page_mem;
+ 	struct f2fs_dev_stats *dev_stats;
++
++	//[zest1]
++	unsigned long long nr_meta_wblks[META_MAX];
++	unsigned long long nr_wblks[NR_IO_TYPE];
++	unsigned long long nr_wbytes[NR_IO_TYPE];
+ };
+ 
+ static inline struct f2fs_stat_info *F2FS_STAT(struct f2fs_sb_info *sbi)
+@@ -4205,6 +4242,20 @@ static inline struct f2fs_stat_info *F2FS_STAT(struct f2fs_sb_info *sbi)
+ 		si->bg_node_blks += ((gc_type) == BG_GC) ? (blks) : 0;	\
+ 	} while (0)
+ 
++//[zest1]
++#define zest_stat_inc_meta_count(sbi, blkaddr)				\
++	do {								\
++		struct f2fs_stat_info *si = F2FS_STAT(sbi);		\
++		if (blkaddr < SIT_I(sbi)->sit_base_addr)		\
++			(si->nr_meta_wblks[META_CP]++);	\
++		else if (blkaddr < NM_I(sbi)->nat_blkaddr)		\
++			(si->nr_meta_wblks[META_SIT]++);	\
++		else if (blkaddr < SM_I(sbi)->ssa_blkaddr)		\
++			(si->nr_meta_wblks[META_NAT]++);	\
++		else if (blkaddr < SM_I(sbi)->main_blkaddr)		\
++			(si->nr_meta_wblks[META_SSA]++);	\
++	} while (0)
++
+ int f2fs_build_stats(struct f2fs_sb_info *sbi);
+ void f2fs_destroy_stats(struct f2fs_sb_info *sbi);
+ void __init f2fs_create_root_stats(void);
+@@ -4246,6 +4297,8 @@ void f2fs_update_sit_info(struct f2fs_sb_info *sbi);
+ #define stat_inc_tot_blk_count(si, blks)		do { } while (0)
+ #define stat_inc_data_blk_count(sbi, blks, gc_type)	do { } while (0)
+ #define stat_inc_node_blk_count(sbi, blks, gc_type)	do { } while (0)
++//[zest1]
++#define zest_stat_inc_meta_count(sbi, blkaddr)	do { } while (0)
+ 
+ static inline int f2fs_build_stats(struct f2fs_sb_info *sbi) { return 0; }
+ static inline void f2fs_destroy_stats(struct f2fs_sb_info *sbi) { }
+@@ -4686,8 +4739,18 @@ static inline bool f2fs_valid_pinned_area(struct f2fs_sb_info *sbi,
+ {
+ 	if (f2fs_sb_has_blkzoned(sbi)) {
+ 		int devi = f2fs_target_device_index(sbi, blkaddr);
+-
+-		return !bdev_is_zoned(FDEV(devi).bdev);
++		bool zoned = bdev_is_zoned(FDEV(devi).bdev);
++
++		//zest: under zest_enable, swap pin MUST land on the zoned
++		//device; pinned blocks elsewhere are rejected. 
++		if (sbi->zest_enable) {
++			//zest1+zest2: log the predicate result, ratelimited
++			f2fs_info(sbi,
++				"zest: pinned-area check blkaddr=%u zoned=%d valid=%d",
++				blkaddr, zoned, zoned);
++			return zoned;
++		}
++		return !zoned;
+ 	}
+ 	return true;
+ }
+diff --git a/fs/f2fs/gc.c b/fs/f2fs/gc.c
+index 57243d084fee..0a2f8daa9b6b 100644
+--- a/fs/f2fs/gc.c
++++ b/fs/f2fs/gc.c
+@@ -23,6 +23,8 @@
+ #include "iostat.h"
+ #include <trace/events/f2fs.h>
+ 
++//zest1
++#include <linux/zest.h>
+ EXPORT_TRACEPOINT_SYMBOL_GPL(f2fs_gc_begin);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(f2fs_gc_end);
+ 
+@@ -1321,6 +1323,18 @@ static int move_data_block(struct inode *inode, block_t bidx,
+ 				(fio.sbi->gc_mode != GC_URGENT_HIGH) ?
+ 				CURSEG_ALL_DATA_ATGC : CURSEG_COLD_DATA;
+ 
++	/*
++	 * ZEST step 1: GC writes to CURSEG_COLD_DATA directly via
++	 * f2fs_allocate_data_block() and bypasses __get_segment_type(),
++	 * so we must redirect here as well. ATGC path is intentionally
++	 * preserved -- it has its own zone semantics.
++	 */
++	if (fio.sbi->zest_enable && type == CURSEG_COLD_DATA) {
++		type = CURSEG_WARM_DATA;
++		fio.temp = WARM;
++		zest_account_redirect_data();
++	}
++
+ 	/* do not read out */
+ 	page = f2fs_grab_cache_page(mapping, bidx, false);
+ 	if (!page)
+diff --git a/fs/f2fs/gc.h b/fs/f2fs/gc.h
+index feb574c49345..3115c9ff8897 100644
+--- a/fs/f2fs/gc.h
++++ b/fs/f2fs/gc.h
+@@ -193,7 +193,8 @@ static inline bool has_enough_invalid_blocks(struct f2fs_sb_info *sbi)
+ 
+ static inline bool need_to_boost_gc(struct f2fs_sb_info *sbi)
+ {
++	//[zest1] patch https://lkml.org/lkml/2025/6/16/187
+ 	if (f2fs_sb_has_blkzoned(sbi))
+-		return !has_enough_free_blocks(sbi, LIMIT_BOOST_ZONED_GC);
++		return !has_enough_free_blocks(sbi, sbi->gc_thread->boost_zoned_gc_percent);
+ 	return has_enough_invalid_blocks(sbi);
+ }
+diff --git a/fs/f2fs/iostat.c b/fs/f2fs/iostat.c
+index f8703038e1d8..c2a61e696297 100644
+--- a/fs/f2fs/iostat.c
++++ b/fs/f2fs/iostat.c
+@@ -163,6 +163,10 @@ static inline void __f2fs_update_iostat(struct f2fs_sb_info *sbi,
+ {
+ 	sbi->iostat_bytes[type] += io_bytes;
+ 	sbi->iostat_count[type]++;
++	//[zest1]
++	struct f2fs_stat_info *si = F2FS_STAT(sbi);
++	si->nr_wbytes[type] += io_bytes;
++	si->nr_wblks[type] += io_bytes/F2FS_BLKSIZE;
+ }
+ 
+ void f2fs_update_iostat(struct f2fs_sb_info *sbi, struct inode *inode,
+diff --git a/fs/f2fs/segment.c b/fs/f2fs/segment.c
+index f19b9ce65a84..2cc43f1efc91 100644
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@ -25,6 +25,8 @@
+ #include "iostat.h"
+ #include <trace/events/f2fs.h>
+ 
++//zest1
++#include <linux/zest.h>
+ #define __reverse_ffz(x) __reverse_ffs(~(x))
+ 
+ static struct kmem_cache *discard_entry_slab;
+@@ -2741,7 +2743,8 @@ static int is_next_segment_free(struct f2fs_sb_info *sbi,
+  * This function should be returned with success, otherwise BUG
+  */
+ static int get_new_segment(struct f2fs_sb_info *sbi,
+-			unsigned int *newseg, bool new_sec, bool pinning)
++			unsigned int *newseg, bool new_sec, bool pinning,
++			bool force_zoned)
+ {
+ 	struct free_segmap_info *free_i = FREE_I(sbi);
+ 	unsigned int segno, secno, zoneno;
+@@ -2772,12 +2775,26 @@ static int get_new_segment(struct f2fs_sb_info *sbi,
+ 	 * from beginning of the storage, which should be a conventional one.
+ 	 */
+ 	if (f2fs_sb_has_blkzoned(sbi)) {
+-		/* Prioritize writing to conventional zones */
+-		if (sbi->blkzone_alloc_policy == BLKZONE_ALLOC_PRIOR_CONV || pinning)
++		//zest2: under zest_enable, pinned-section allocation must
++		//target zoned zones (f2fs_valid_pinned_area is inverted).
++		//Always start from first_zoned_segno.
++		//zest-fiotest: force_zoned already implies zest_enable (see
++		//new_curseg). It covers pinned sections and, when the
++		//zest_data_zoned knob is set, non-pinned DATA too -- so a plain
++		//file's data lands on zoned for raw-LU FIO measurement.
++		if (force_zoned) {
++			segno = sbi->first_zoned_segno;
++		} else if (sbi->blkzone_alloc_policy == BLKZONE_ALLOC_PRIOR_CONV || pinning) {
++			/* Prioritize writing to conventional zones */
+ 			segno = 0;
+-		else
++		} else {
+ 			segno = max(sbi->first_zoned_segno, *newseg);
++		}
+ 		hint = GET_SEC_FROM_SEG(sbi, segno);
++		// if (sbi->zest_enable && pinning)
++		// 	f2fs_debug(sbi,
++		// 		"zest: get_new_segment pinning hint segno=%u secno=%u first_zoned_segno=%u *newseg=%u",
++		// 		segno, hint, sbi->first_zoned_segno, *newseg);
+ 	}
+ #endif
+ 
+@@ -2787,9 +2804,17 @@ static int get_new_segment(struct f2fs_sb_info *sbi,
+ #ifdef CONFIG_BLK_DEV_ZONED
+ 	if (secno >= MAIN_SECS(sbi) && f2fs_sb_has_blkzoned(sbi)) {
+ 		/* Write only to sequential zones */
+-		if (sbi->blkzone_alloc_policy == BLKZONE_ALLOC_ONLY_SEQ) {
++		//zest2: also force ONLY_SEQ-style fallback under zest pinning
++		//so we don't drop into find_first_zero_bit (which starts at 0
++		//and ends up in conv FDEV(0) / FDEV(2)).
++		if (sbi->blkzone_alloc_policy == BLKZONE_ALLOC_ONLY_SEQ ||
++		    force_zoned) {
+ 			hint = GET_SEC_FROM_SEG(sbi, sbi->first_zoned_segno);
+ 			secno = find_next_zero_bit(free_i->free_secmap, MAIN_SECS(sbi), hint);
++			if (force_zoned)
++				f2fs_debug(sbi,
++					"zest: get_new_segment fallback (zoned-only) secno=%u",
++					secno);
+ 		} else
+ 			secno = find_first_zero_bit(free_i->free_secmap,
+ 								MAIN_SECS(sbi));
+@@ -2937,13 +2962,23 @@ static int new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
+ 	struct curseg_info *curseg = CURSEG_I(sbi, type);
+ 	unsigned int segno = curseg->segno;
+ 	bool pinning = type == CURSEG_COLD_DATA_PINNED;
++	//zest-fiotest: force_zoned drives ONLY the zoned-targeting branches in
++	//get_new_segment (it does NOT alter pinning's -ENOSPC/bug_on/SSR/stop-
++	//checkpoint semantics). It is meaningful ONLY under zest_enable: that's
++	//when pinned sections must land on zoned (without zest_enable, pinned
++	//goes to conventional via the existing `|| pinning` branch -> segno 0).
++	//With the zest_data_zoned knob, plain DATA cursegs are forced to zoned
++	//too so a fallocate'd file can be FIO O_DIRECT written onto zoned for
++	//raw-LU BW measurement.
++	bool force_zoned = sbi->zest_enable &&
++		(pinning || (sbi->zest_data_zoned && IS_DATASEG(type)));
+ 	int ret;
+ 
+ 	if (curseg->inited)
+ 		write_sum_page(sbi, curseg->sum_blk, GET_SUM_BLOCK(sbi, segno));
+ 
+ 	segno = __get_next_segno(sbi, type);
+-	ret = get_new_segment(sbi, &segno, new_sec, pinning);
++	ret = get_new_segment(sbi, &segno, new_sec, pinning, force_zoned);
+ 	if (ret) {
+ 		if (ret == -ENOSPC)
+ 			reset_curseg_fields(curseg);
+@@ -3282,6 +3317,8 @@ static int __allocate_new_segment(struct f2fs_sb_info *sbi, int type,
+ 		return err;
+ 	stat_inc_seg_type(sbi, curseg);
+ 	locate_dirty_segment(sbi, old_segno);
++	// f2fs_debug(sbi, "zest: Allocated new segment %u for type %d (old %u)",
++	// 		curseg->segno, type, old_segno);
+ 	return 0;
+ }
+ 
+@@ -3309,11 +3346,37 @@ int f2fs_allocate_pinning_section(struct f2fs_sb_info *sbi)
+ 	f2fs_unlock_op(sbi);
+ 
+ 	if (f2fs_sb_has_blkzoned(sbi) && err == -EAGAIN && gc_required) {
++		unsigned int gc_start = 0;
++		unsigned int gc_end = GET_SEGNO(sbi, FDEV(0).end_blk);
++
++		//zest: when zest_enable, pinning targets zoned dev only,
++		//so GC the first zoned FDEV's range instead of FDEV(0)
++		//(conventional, won't free any zoned section).
++		if (sbi->zest_enable) {
++			int i;
++
++			for (i = 0; i < sbi->s_ndevs; i++) {
++				if (bdev_is_zoned(FDEV(i).bdev)) {
++					gc_start = GET_SEGNO(sbi, FDEV(i).start_blk);
++					gc_end = GET_SEGNO(sbi, FDEV(i).end_blk);
++					break;
++				}
++			}
++			f2fs_notice(sbi,
++				"zest: pinning -EAGAIN, GC zoned range FDEV(%d) segno [%u,%u]",
++				i, gc_start, gc_end);
++		}
++
+ 		f2fs_down_write(&sbi->gc_lock);
+-		err = f2fs_gc_range(sbi, 0, GET_SEGNO(sbi, FDEV(0).end_blk),
++		err = f2fs_gc_range(sbi, gc_start, gc_end,
+ 				true, ZONED_PIN_SEC_REQUIRED_COUNT);
+ 		f2fs_up_write(&sbi->gc_lock);
+ 
++		if (sbi->zest_enable)
++			f2fs_notice(sbi,
++				"zest: pinning GC range done err=%d, retry=%s",
++				err, err ? "no" : "yes");
++
+ 		gc_required = false;
+ 		if (!err)
+ 			goto retry;
+@@ -3698,6 +3761,23 @@ static int __get_segment_type(struct f2fs_io_info *fio)
+ 	default:
+ 		f2fs_bug_on(fio->sbi, true);
+ 	}
++	/*
++	 * ZEST step 1: redirect cold-temperature writes to warm so we
++	 * can free up the open-zone slot occupied by CURSEG_COLD_DATA /
++	 * CURSEG_COLD_NODE. Pinned-cold (CURSEG_COLD_DATA_PINNED) and
++	 * ATGC (CURSEG_ALL_DATA_ATGC) are left untouched -- they have
++	 * different lifetimes and the swap-pinning path depends on the
++	 * former.
++	 */
++	if (fio->sbi->zest_enable) {
++		if (type == CURSEG_COLD_DATA) {
++			type = CURSEG_WARM_DATA;
++			zest_account_redirect_data();
++		} else if (type == CURSEG_COLD_NODE) {
++			type = CURSEG_WARM_NODE;
++			zest_account_redirect_node();
++		}
++	}
+ 
+ 	fio->temp = f2fs_get_segment_temp(fio->sbi, type);
+ 
+@@ -3730,6 +3810,17 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
+ 	bool segment_full = false;
+ 	int ret = 0;
+ 
++	/*
++	 * [zest1] After step-1 redirect, no allocator should target the
++	 * cold cursegs. If this fires, a path bypassed __get_segment_type
++	 * and the gc.c redirect -- we need to find and patch it before
++	 * the cold zone close in commit B is safe.
++	 */
++	WARN_ONCE(sbi->zest_enable &&
++		  (type == CURSEG_COLD_DATA || type == CURSEG_COLD_NODE),
++		  "zest: cold curseg write leaked through redirect: type=%d\n",
++		  type);
++
+ 	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+ 
+ 	mutex_lock(&curseg->curseg_mutex);
+@@ -3905,7 +3996,8 @@ static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
+ 	enum log_type type = __get_segment_type(fio);
+ 	int seg_type = log_type_to_seg_type(type);
+ 	bool keep_order = (f2fs_lfs_mode(fio->sbi) &&
+-				seg_type == CURSEG_COLD_DATA);
++                   (seg_type == CURSEG_COLD_DATA ||
++                    (fio->sbi->zest_enable && seg_type == CURSEG_WARM_DATA))); //zest1
+ 
+ 	if (keep_order)
+ 		f2fs_down_read(&fio->sbi->io_order_lock);
+@@ -3954,6 +4046,8 @@ void f2fs_do_write_meta_page(struct f2fs_sb_info *sbi, struct folio *folio,
+ 	f2fs_submit_page_write(&fio);
+ 
+ 	stat_inc_meta_count(sbi, folio->index);
++	//[zest1]
++	zest_stat_inc_meta_count(sbi, folio->index);
+ 	f2fs_update_iostat(sbi, NULL, io_type, F2FS_BLKSIZE);
+ }
+ 
+diff --git a/fs/f2fs/super.c b/fs/f2fs/super.c
+index bc164359aec1..5650503321e8 100644
+--- a/fs/f2fs/super.c
++++ b/fs/f2fs/super.c
+@@ -4680,6 +4680,16 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
+ 	if (err)
+ 		goto free_bio_info;
+ 
++	//zest1
++	sbi->zest_enable = false;
++	//zest-fiotest: data-to-zoned redirect off by default.
++	sbi->zest_data_zoned = 0;
++	//zest3: default over-provisioning 1:1 (OP == swap-visible capacity).
++	sbi->zest_op_ratio = 100;
++	//zest-gc: GC on by default; trigger below 2 free zones, top up to 4.
++	sbi->zest_gc_enable = 1;
++	sbi->zest_gc_threshold = 2;
++	sbi->zest_gc_target = 4;
+ 	err = init_percpu_info(sbi);
+ 	if (err)
+ 		goto free_iostat;
+diff --git a/fs/f2fs/sysfs.c b/fs/f2fs/sysfs.c
+index 20946cf374db..a30a9eb6c65c 100644
+--- a/fs/f2fs/sysfs.c
++++ b/fs/f2fs/sysfs.c
+@@ -332,8 +332,96 @@ static ssize_t avg_vblocks_show(struct f2fs_attr *a,
+ 	f2fs_update_sit_info(sbi);
+ 	return sysfs_emit(buf, "%llu\n", (unsigned long long)(si->avg_vblocks));
+ }
++
++//[zest1]
++static ssize_t gc_wblks_show(struct f2fs_attr *a,
++		struct f2fs_sb_info *sbi, char *buf)
++{
++	struct f2fs_stat_info *si = F2FS_STAT(sbi);
++
++	return sysfs_emit(buf, "%llu\n", (unsigned long long)(si->nr_wblks[FS_GC_DATA_IO]+si->nr_wblks[FS_GC_NODE_IO]));
++}
++
++static ssize_t cp_main_wblks_show(struct f2fs_attr *a,
++		struct f2fs_sb_info *sbi, char *buf)
++{
++	struct f2fs_stat_info *si = F2FS_STAT(sbi);
++
++	return sysfs_emit(buf, "%llu\n", (unsigned long long)(si->nr_wblks[FS_CP_DATA_IO]+si->nr_wblks[FS_CP_NODE_IO]));
++}
++
++static ssize_t zest_main_wblks_show(struct f2fs_attr *a,
++		struct f2fs_sb_info *sbi, char *buf)
++{
++	struct f2fs_stat_info *si = F2FS_STAT(sbi);
++
++	return sysfs_emit(buf, "%llu\n", (unsigned long long)(si->nr_wblks[APP_WRITE_IO]+si->nr_wblks[APP_MAPPED_IO])+si->nr_wblks[FS_DATA_IO]+si->nr_wblks[FS_NODE_IO]+si->nr_wblks[FS_GC_DATA_IO]+si->nr_wblks[FS_GC_NODE_IO]+si->nr_wblks[FS_CP_DATA_IO]+si->nr_wblks[FS_CP_NODE_IO]);
++}
++
++static ssize_t zest_meta_wblks_show(struct f2fs_attr *a,
++		struct f2fs_sb_info *sbi, char *buf)
++{
++	struct f2fs_stat_info *si = F2FS_STAT(sbi);
++
++	return sysfs_emit(buf, "%llu\n", (unsigned long long)(si->nr_wblks[FS_META_IO]+si->nr_wblks[FS_CP_META_IO]));
++}
++
++static ssize_t device_layout_show(struct f2fs_attr *a,
++        struct f2fs_sb_info *sbi, char *buf)
++{
++    int i, len = 0;
++    
++    if (!sbi->s_ndevs) {
++        return sysfs_emit(buf, "single device: start=%u end=%u zoned=%d\n",
++                          0, MAX_BLKADDR(sbi),
++                          bdev_is_zoned(sbi->sb->s_bdev));
++    }
++    
++    for (i = 0; i < sbi->s_ndevs; i++) {
++        len += sysfs_emit_at(buf, len,
++            "dev%d: path=%s start_blk=%u end_blk=%u nr_blocks=%u zoned=%d\n",
++            i,
++            FDEV(i).path,
++            FDEV(i).start_blk,
++            FDEV(i).end_blk,
++            FDEV(i).end_blk - FDEV(i).start_blk + 1,
++            bdev_is_zoned(FDEV(i).bdev));
++    }
++    return len;
++}
++
++static ssize_t f2fs_layout_show(struct f2fs_attr *a,
++        struct f2fs_sb_info *sbi, char *buf)
++{
++    struct f2fs_sm_info *sm_i = SM_I(sbi);
++    
++    return sysfs_emit(buf,
++        "seg0_blkaddr=%u\n"
++        "main_blkaddr=%u\n"
++        "ssa_blkaddr=%u\n"
++        "nat_blkaddr=%u\n"
++        "sit_blkaddr=%u\n"
++        "cp_blkaddr=%u\n"
++        "segs_per_sec=%u\n"
++        "blocks_per_seg=%u\n",
++        sm_i->seg0_blkaddr,
++        sm_i->main_blkaddr,
++        sm_i->ssa_blkaddr,
++        NM_I(sbi)->nat_blkaddr,
++        sm_i->sit_info->sit_base_addr,
++        le32_to_cpu(F2FS_RAW_SUPER(sbi)->cp_blkaddr),
++        sbi->segs_per_sec,
++        sbi->blocks_per_seg);
++}
+ #endif
+ 
++//[zest1]
++static ssize_t zest_zone_summary_show(struct f2fs_attr *a,
++				      struct f2fs_sb_info *sbi, char *buf)
++{
++	return f2fs_zest_zone_summary_emit(sbi, buf, PAGE_SIZE);
++}
++
+ static ssize_t main_blkaddr_show(struct f2fs_attr *a,
+ 				struct f2fs_sb_info *sbi, char *buf)
+ {
+@@ -644,6 +732,12 @@ static ssize_t __sbi_store(struct f2fs_attr *a,
+ 		return count;
+ 	}
+ 
++	//[zest1] patch https://lkml.org/lkml/2025/6/16/187
++	if (!strcmp(a->attr.name, "gc_boost_zoned_gc_percent")) {
++		if (t > 100)
++			return -EINVAL;
++	}
++
+ #ifdef CONFIG_F2FS_IOSTAT
+ 	if (!strcmp(a->attr.name, "iostat_enable")) {
+ 		sbi->iostat_enable = !!t;
+@@ -662,6 +756,83 @@ static ssize_t __sbi_store(struct f2fs_attr *a,
+ 	}
+ #endif
+ 
++	//zest1
++	if (!strcmp(a->attr.name, "zest_enable")) {
++		bool new_v = !!t;
++		bool old_v = sbi->zest_enable;
++
++		sbi->zest_enable = new_v;
++
++		/*
++		 * 0 -> 1 transition: redirect is now active so no new writes
++		 * land in the cold cursegs. Evacuate the cold_data section
++		 * via targeted GC and RESET its zone -- that frees the
++		 * open-zone slot and gives us an EMPTY zone we can later
++		 * donate to swap. RESET is safe because evacuation drives
++		 * SIT to zero for that section before the RESET issues.
++		 *
++		 * This blocks the sysfs writer for the duration of the
++		 * evacuation. After redirect has been on for a while the
++		 * cold section is mostly empty and this is fast; on first
++		 * activation it can take longer (~ valid_blocks * IO cost).
++		 */
++		if (!old_v && new_v) {
++			int err = f2fs_zest_evacuate_cold_section(sbi);
++
++			if (err)
++			{
++				f2fs_warn(sbi,
++					"zest_enable 0->1: evacuate err=%d",
++					err);
++				sbi->zest_enable = old_v;
++			}
++			else
++				f2fs_notice(sbi,
++					"zest_enable 0->1: cold section evacuated and reset");
++		}
++		return count;
++	}
++
++	//zest-fiotest: force non-pinned DATA allocation onto the zoned device
++	//(0/1), live. Only effective together with zest_enable. Lets a plain
++	//fallocate'd file's O_DIRECT writes land on zoned for raw-LU FIO BW
++	//measurement. See struct f2fs_sb_info::zest_data_zoned.
++	if (!strcmp(a->attr.name, "zest_data_zoned")) {
++		sbi->zest_data_zoned = !!t;
++		return count;
++	}
++
++	//zest3: OP ratio (percent of swap-visible capacity). Clamp to a sane
++	//ceiling so sis->max * ratio / 100 can't overflow; read at swapon.
++	if (!strcmp(a->attr.name, "zest_op_ratio")) {
++		if (t > 1000)
++			return -EINVAL;
++		sbi->zest_op_ratio = (unsigned int)t;
++		return count;
++	}
++
++	//zest-gc: GC enable (0/1), live.
++	if (!strcmp(a->attr.name, "zest_gc_enable")) {
++		sbi->zest_gc_enable = !!t;
++		return count;
++	}
++	//zest-gc: free-zone trigger threshold. Clamp to a sane ceiling.
++	if (!strcmp(a->attr.name, "zest_gc_threshold")) {
++		if (t > 1024)
++			return -EINVAL;
++		sbi->zest_gc_threshold = (unsigned int)t;
++		if (sbi->zest_gc_target < sbi->zest_gc_threshold)
++			sbi->zest_gc_target = sbi->zest_gc_threshold;
++		return count;
++	}
++	//zest-gc: free-zone top-up target per GC cycle (>= threshold).
++	if (!strcmp(a->attr.name, "zest_gc_target")) {
++		if (t > 1024)
++			return -EINVAL;
++		sbi->zest_gc_target = (unsigned int)t;
++		return count;
++	}
++
+ #ifdef CONFIG_BLK_DEV_ZONED
+ 	if (!strcmp(a->attr.name, "blkzone_alloc_policy")) {
+ 		if (t < BLKZONE_ALLOC_PRIOR_SEQ || t > BLKZONE_ALLOC_PRIOR_CONV)
+@@ -1121,6 +1292,14 @@ F2FS_SBI_GENERAL_RW_ATTR(dir_level);
+ F2FS_SBI_GENERAL_RW_ATTR(iostat_enable);
+ F2FS_SBI_GENERAL_RW_ATTR(iostat_period_ms);
+ #endif
++//zest1
++F2FS_SBI_GENERAL_RW_ATTR(zest_enable);
++F2FS_SBI_GENERAL_RW_ATTR(zest_data_zoned);
++F2FS_SBI_GENERAL_RW_ATTR(zest_op_ratio);
++//zest-gc
++F2FS_SBI_GENERAL_RW_ATTR(zest_gc_enable);
++F2FS_SBI_GENERAL_RW_ATTR(zest_gc_threshold);
++F2FS_SBI_GENERAL_RW_ATTR(zest_gc_target);
+ F2FS_SBI_GENERAL_RW_ATTR(readdir_ra);
+ F2FS_SBI_GENERAL_RW_ATTR(max_io_bytes);
+ F2FS_SBI_GENERAL_RW_ATTR(data_io_flag);
+@@ -1161,6 +1340,28 @@ STAT_INFO_RO_ATTR(cp_foreground_calls, cp_call_count[FOREGROUND]);
+ STAT_INFO_RO_ATTR(cp_background_calls, cp_call_count[BACKGROUND]);
+ STAT_INFO_RO_ATTR(gc_foreground_calls, gc_call_count[FOREGROUND]);
+ STAT_INFO_RO_ATTR(gc_background_calls, gc_call_count[BACKGROUND]);
++
++//[zest1]
++STAT_INFO_RO_ATTR(meta_cp_wblks, nr_meta_wblks[META_CP]);
++STAT_INFO_RO_ATTR(meta_nat_wblks, nr_meta_wblks[META_NAT]);
++STAT_INFO_RO_ATTR(meta_sit_wblks, nr_meta_wblks[META_SIT]);
++STAT_INFO_RO_ATTR(meta_ssa_wblks, nr_meta_wblks[META_SSA]);
++
++STAT_INFO_RO_ATTR(app_direct_wblks, nr_wblks[APP_DIRECT_IO]);
++STAT_INFO_RO_ATTR(app_buffered_wblks, nr_wblks[APP_BUFFERED_IO]);
++STAT_INFO_RO_ATTR(app_write_wblks, nr_wblks[APP_WRITE_IO]);
++STAT_INFO_RO_ATTR(app_mapped_wblks, nr_wblks[APP_MAPPED_IO]);
++STAT_INFO_RO_ATTR(fs_data_wblks, nr_wblks[FS_DATA_IO]);
++STAT_INFO_RO_ATTR(fs_node_wblks, nr_wblks[FS_NODE_IO]);
++STAT_INFO_RO_ATTR(fs_meta_wblks, nr_wblks[FS_META_IO]);
++STAT_INFO_RO_ATTR(fs_gc_data_wblks, nr_wblks[FS_GC_DATA_IO]);
++STAT_INFO_RO_ATTR(fs_gc_node_wblks, nr_wblks[FS_GC_NODE_IO]);
++STAT_INFO_RO_ATTR(fs_cp_data_wblks, nr_wblks[FS_CP_DATA_IO]);
++STAT_INFO_RO_ATTR(fs_cp_node_wblks, nr_wblks[FS_CP_NODE_IO]);
++STAT_INFO_RO_ATTR(fs_cp_meta_wblks, nr_wblks[FS_CP_META_IO]);
++STAT_INFO_RO_ATTR(fs_discard_wblks, nr_wblks[FS_DISCARD_IO]);
++STAT_INFO_RO_ATTR(fs_flush_wblks, nr_wblks[FS_FLUSH_IO]);
++STAT_INFO_RO_ATTR(fs_zone_reset_wblks, nr_wblks[FS_ZONE_RESET_IO]);
+ #endif
+ 
+ /* FAULT_INFO ATTR */
+@@ -1200,8 +1401,18 @@ F2FS_GENERAL_RO_ATTR(gc_mode);
+ F2FS_GENERAL_RO_ATTR(moved_blocks_background);
+ F2FS_GENERAL_RO_ATTR(moved_blocks_foreground);
+ F2FS_GENERAL_RO_ATTR(avg_vblocks);
++//[zest1]
++F2FS_GENERAL_RO_ATTR(gc_wblks);
++F2FS_GENERAL_RO_ATTR(cp_main_wblks);
++F2FS_GENERAL_RO_ATTR(zest_main_wblks);
++F2FS_GENERAL_RO_ATTR(zest_meta_wblks);
++F2FS_GENERAL_RO_ATTR(device_layout);
++F2FS_GENERAL_RO_ATTR(f2fs_layout);
+ #endif
+ 
++//[zest1]
++F2FS_GENERAL_RO_ATTR(zest_zone_summary);
++
+ #ifdef CONFIG_FS_ENCRYPTION
+ F2FS_FEATURE_RO_ATTR(encryption);
+ F2FS_FEATURE_RO_ATTR(test_dummy_encryption_v2);
+@@ -1285,6 +1496,13 @@ static struct attribute *f2fs_attrs[] = {
+ 	ATTR_LIST(iostat_enable),
+ 	ATTR_LIST(iostat_period_ms),
+ #endif
++	//zest1
++	ATTR_LIST(zest_enable),
++	ATTR_LIST(zest_data_zoned),
++	ATTR_LIST(zest_op_ratio),
++	ATTR_LIST(zest_gc_enable),
++	ATTR_LIST(zest_gc_threshold),
++	ATTR_LIST(zest_gc_target),
+ 	ATTR_LIST(readdir_ra),
+ 	ATTR_LIST(max_io_bytes),
+ 	ATTR_LIST(gc_pin_file_thresh),
+@@ -1317,7 +1535,35 @@ static struct attribute *f2fs_attrs[] = {
+ 	ATTR_LIST(moved_blocks_foreground),
+ 	ATTR_LIST(moved_blocks_background),
+ 	ATTR_LIST(avg_vblocks),
++		//[zest1]
++	ATTR_LIST(gc_wblks),
++	ATTR_LIST(cp_main_wblks),
++	ATTR_LIST(zest_main_wblks),
++	ATTR_LIST(zest_meta_wblks),
++	ATTR_LIST(meta_cp_wblks),
++	ATTR_LIST(meta_nat_wblks),
++	ATTR_LIST(meta_sit_wblks),
++	ATTR_LIST(meta_ssa_wblks),
++	ATTR_LIST(app_direct_wblks),
++	ATTR_LIST(app_buffered_wblks),
++	ATTR_LIST(app_write_wblks),
++	ATTR_LIST(app_mapped_wblks),
++	ATTR_LIST(fs_data_wblks),
++	ATTR_LIST(fs_node_wblks),
++	ATTR_LIST(fs_meta_wblks),
++	ATTR_LIST(fs_gc_data_wblks),
++	ATTR_LIST(fs_gc_node_wblks),
++	ATTR_LIST(fs_cp_data_wblks),
++	ATTR_LIST(fs_cp_node_wblks),
++	ATTR_LIST(fs_cp_meta_wblks),
++	ATTR_LIST(fs_discard_wblks),
++	ATTR_LIST(fs_flush_wblks),
++	ATTR_LIST(fs_zone_reset_wblks),
++	ATTR_LIST(device_layout),
++	ATTR_LIST(f2fs_layout),
+ #endif
++	//[zest1]
++	ATTR_LIST(zest_zone_summary),
+ #ifdef CONFIG_BLK_DEV_ZONED
+ 	ATTR_LIST(unusable_blocks_per_sec),
+ 	ATTR_LIST(blkzone_alloc_policy),
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index f691949a785b..414b89cc62ca 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -59,6 +59,10 @@ typedef __u32 __bitwise req_flags_t;
+ #define RQF_SPECIAL_PAYLOAD	((__force req_flags_t)(1 << 18))
+ /* The per-zone write lock is held for this request */
+ #define RQF_ZONE_WRITE_LOCKED	((__force req_flags_t)(1 << 19))
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++/* request completion needs to be signaled to zone write plugging. */
++#define RQF_ZONE_WRITE_PLUGGING	((__force req_flags_t)(1 << 14))
++#endif
+ /* ->timeout has been called, don't expire again */
+ #define RQF_TIMED_OUT		((__force req_flags_t)(1 << 21))
+ #define RQF_RESV		((__force req_flags_t)(1 << 23))
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 6d7856414bb7..263c144c0c7b 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -356,6 +356,10 @@ enum {
+ 	BIO_QOS_MERGED,		/* but went through rq_qos merge path */
+ 	BIO_REMAPPED,
+ 	BIO_ZONE_WRITE_LOCKED,	/* Owns a zoned device zone write lock */
++#ifdef CONFIG_BLK_ZONE_WRITE_PLUGGING	/* zest1 */
++	BIO_ZONE_WRITE_PLUGGING, /* bio handled through zone write plugging */
++	BIO_EMULATES_ZONE_APPEND, /* bio emulates a zone append operation */
++#endif
+ 	BIO_FLAG_LAST
+ };
+ 
+diff --git a/kernel/module/gki_module.c b/kernel/module/gki_module.c
+index 65a2883b539e..40a0497d664b 100644
+--- a/kernel/module/gki_module.c
++++ b/kernel/module/gki_module.c
+@@ -34,6 +34,7 @@ static int cmp_name(const void *sym, const void *protected_sym)
+  */
+ bool gki_is_module_protected_export(const char *name)
+ {
++	return false; //zest1
+ 	if (NR_UNPROTECTED_SYMBOLS) {
+ 		return bsearch(name, gki_protected_exports_symbols, NR_PROTECTED_EXPORTS_SYMBOLS,
+ 		       MAX_PROTECTED_EXPORTS_NAME_LEN, cmp_name) != NULL;
+diff --git a/kernel/module/version.c b/kernel/module/version.c
+index 53f43ac5a73e..a96005d1a7d3 100644
+--- a/kernel/module/version.c
++++ b/kernel/module/version.c
+@@ -15,6 +15,7 @@ int check_version(const struct load_info *info,
+ 			 struct module *mod,
+ 			 const s32 *crc)
+ {
++	return 1; //zest1
+ 	Elf_Shdr *sechdrs = info->sechdrs;
+ 	unsigned int versindex = info->index.vers;
+ 	unsigned int i, num_versions;
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 2b86f4fd9abd..0f172a0bdf27 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1361,6 +1361,20 @@ config MEMFD_ASHMEM_SHIM
+ 
+ 	  Unless you are running Android, say N.
+ 
++config ZEST_SWAP
++	bool "Zoned-storage swap layer for F2FS (ZEST)"
++	depends on SWAP && BLK_DEV_ZONED && F2FS_FS
++	default n
++	help
++	  ZEST is a lightweight swap layer that intercepts swap I/O
++	  and redirects it through a host-managed zone pool borrowed
++	  from F2FS on a zoned UFS device.
++
++	  Off by default. Runtime toggle:
++	      echo 1 > /sys/kernel/zest/enable
++
++	  If unsure, say N.
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+diff --git a/mm/Makefile b/mm/Makefile
+index 29037c2c8c99..c7fbeebec4cd 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -138,6 +138,8 @@ obj-$(CONFIG_PERCPU_STATS) += percpu-stats.o
+ obj-$(CONFIG_ZONE_DEVICE) += memremap.o
+ obj-$(CONFIG_HMM_MIRROR) += hmm.o
+ obj-$(CONFIG_MEMFD_CREATE) += memfd.o
++#zest1
++obj-$(CONFIG_ZEST_SWAP)         += zest/
+ obj-$(CONFIG_MEMFD_ASHMEM_SHIM) += memfd-ashmem-shim.o
+ obj-$(CONFIG_MAPPING_DIRTY_HELPERS) += mapping_dirty_helpers.o
+ obj-$(CONFIG_PTDUMP_CORE) += ptdump.o
+diff --git a/mm/memory.c b/mm/memory.c
+index 2646e93c9004..f30fc91e619c 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -64,6 +64,7 @@
+ #include <linux/memcontrol.h>
+ #include <linux/mmu_notifier.h>
+ #include <linux/swapops.h>
++#include <linux/zest.h>
+ #include <linux/elf.h>
+ #include <linux/gfp.h>
+ #include <linux/migrate.h>
+@@ -3877,8 +3878,13 @@ static inline bool should_try_to_free_swap(struct folio *folio,
+ {
+ 	if (!folio_test_swapcache(folio))
+ 		return false;
+-	if (mem_cgroup_swap_full(folio) || (vma->vm_flags & VM_LOCKED) ||
+-	    folio_test_mlocked(folio))
++	//zest-znswap: keep mlocked/VM_LOCKED trimming, but suppress the
++	//vm_swap_full()-driven trim when the page lives on the ZEST swapfile and
++	//there is physical zone headroom -- a clean swapped-in page can then be
++	//dropped later without rewriting (its on-device copy is still valid).
++	if (folio_test_mlocked(folio) || (vma->vm_flags & VM_LOCKED))
++		return true;
++	if (mem_cgroup_swap_full(folio) && !zest_swap_retain_cache(folio))
+ 		return true;
+ 	/*
+ 	 * If we want to map a page that's in the swapcache writable, we
+@@ -4219,6 +4225,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	if (unlikely(!si))
+ 		goto out;
+ 
++	swapout_slot_order_capture_record(entry);
++
+ 	folio = swap_cache_get_folio(entry, vma, vmf->address);
+ 	if (folio)
+ 		page = folio_file_page(folio, swp_offset(entry));
+@@ -4267,6 +4275,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 
+ 				/* To provide entry to swap_readpage() */
+ 				folio->swap = entry;
++				swapin_slot_capture_record(page, vmf->address, 0);
+ 				swap_readpage(page, true, NULL);
+ 				folio->private = NULL;
+ 			}
+diff --git a/mm/page_io.c b/mm/page_io.c
+index a3feadd1ba9e..1a0f200066b9 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -25,6 +25,7 @@
+ #include <linux/sched/task.h>
+ #include <linux/delayacct.h>
+ #include <linux/zswap.h>
++#include <linux/zest.h> //zest1
+ #include "swap.h"
+ 
+ #undef CREATE_TRACE_POINTS
+@@ -378,6 +379,15 @@ void __swap_writepage(struct page *page, struct writeback_control *wbc)
+ 	unsigned long sis_flags = 0;
+ 
+ 	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
++
++	swapout_slot_order_record(page);
++
++	//zest1
++	/* ZEST: redirect swap-out if this swapfile is managed by ZEST. */
++	if (zest_should_intercept(sis)) {
++		zest_swap_writepage(page, wbc, sis);
++		return;
++	}
+ 	/*
+ 	 * ->flags can be updated non-atomicially (scan_swap_map_slots),
+ 	 * but that will never affect SWP_FS_OPS, so the data_race
+@@ -545,11 +555,21 @@ void swap_readpage(struct page *page, bool synchronous, struct swap_iocb **plug)
+ 	if (zswap_load(folio)) {
+ 		folio_mark_uptodate(folio);
+ 		folio_unlock(folio);
++	} else if (zest_should_intercept(sis)) {
++		swap_slot_reread_monitor_read(page_swap_entry(page));
++		/*
++		 * ZEST: this swapfile's blocks live on a zoned device and
++		 * are remapped by ZEST. Bypass the standard bdev path.
++		 */
++		zest_swap_readpage(folio, sis);
+ 	} else if (data_race(sis->flags & SWP_FS_OPS)) {
++		swap_slot_reread_monitor_read(page_swap_entry(page));
+ 		swap_readpage_fs(page, plug);
+ 	} else if (synchronous || (sis->flags & SWP_SYNCHRONOUS_IO)) {
++		swap_slot_reread_monitor_read(page_swap_entry(page));
+ 		swap_readpage_bdev_sync(folio, sis);
+ 	} else {
++		swap_slot_reread_monitor_read(page_swap_entry(page));
+ 		swap_readpage_bdev_async(folio, sis);
+ 	}
+ 
+diff --git a/mm/swap.h b/mm/swap.h
+index 500f99202776..76ec55e344a5 100644
+--- a/mm/swap.h
++++ b/mm/swap.h
+@@ -56,6 +56,29 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t flag,
+ 				    struct vm_fault *vmf);
+ struct page *swapin_readahead(swp_entry_t entry, gfp_t flag,
+ 			      struct vm_fault *vmf);
++void swapin_slot_capture_record(struct page *page, unsigned long addr,
++				u64 ra_win_id);
++void swapout_slot_order_record(struct page *page);
++u64 swapout_slot_order_lookup(swp_entry_t entry);
++bool swapout_slot_order_tracking_enabled(void);
++void swapout_slot_order_tracking_set(bool enabled);
++void swapout_slot_order_capture_record(swp_entry_t entry);
++
++struct swap_slot_reread_monitor_stats {
++	bool enabled;
++	u64 total_io_reads;
++	u64 repeated_io_reads;
++	u64 freed_read_slots;
++	u64 freed_repeated_slots;
++};
++
++int swap_slot_reread_monitor_set(bool enabled);
++void swap_slot_reread_monitor_get_stats(
++		struct swap_slot_reread_monitor_stats *stats);
++void swap_slot_reread_monitor_read(swp_entry_t entry);
++void swap_slot_reread_monitor_free(struct swap_info_struct *si,
++				   unsigned long offset,
++				   unsigned int nr_entries);
+ 
+ static inline unsigned int folio_swap_flags(struct folio *folio)
+ {
+@@ -92,6 +115,62 @@ static inline struct page *swapin_readahead(swp_entry_t swp, gfp_t gfp_mask,
+ 	return NULL;
+ }
+ 
++static inline void swapin_slot_capture_record(struct page *page,
++					      unsigned long addr, u64 ra_win_id)
++{
++}
++
++static inline void swapout_slot_order_record(struct page *page)
++{
++}
++
++static inline u64 swapout_slot_order_lookup(swp_entry_t entry)
++{
++	return 0;
++}
++
++static inline bool swapout_slot_order_tracking_enabled(void)
++{
++	return false;
++}
++
++static inline void swapout_slot_order_tracking_set(bool enabled)
++{
++}
++
++static inline void swapout_slot_order_capture_record(swp_entry_t entry)
++{
++}
++
++struct swap_slot_reread_monitor_stats {
++	bool enabled;
++	u64 total_io_reads;
++	u64 repeated_io_reads;
++	u64 freed_read_slots;
++	u64 freed_repeated_slots;
++};
++
++static inline int swap_slot_reread_monitor_set(bool enabled)
++{
++	return 0;
++}
++
++static inline void swap_slot_reread_monitor_get_stats(
++		struct swap_slot_reread_monitor_stats *stats)
++{
++	*stats = (struct swap_slot_reread_monitor_stats){};
++}
++
++static inline void swap_slot_reread_monitor_read(swp_entry_t entry)
++{
++}
++
++static inline void swap_slot_reread_monitor_free(struct swap_info_struct *si,
++						 unsigned long offset,
++						 unsigned int nr_entries)
++{
++}
++
+ static inline int swap_writepage(struct page *p, struct writeback_control *wbc)
+ {
+ 	return 0;
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index d12dedc52a81..e32f81eb5ac7 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -21,6 +21,8 @@
+ #include <linux/swap_slots.h>
+ #include <linux/huge_mm.h>
+ #include <linux/shmem_fs.h>
++#include <linux/math64.h>
++#include <linux/zest.h>	//zest-vra: ZEST-private VMA readahead hook
+ #include "internal.h"
+ #include "swap.h"
+ 
+@@ -60,6 +62,92 @@ static bool enable_vma_readahead __read_mostly = true;
+ 
+ static atomic_t swapin_readahead_hits = ATOMIC_INIT(4);
+ 
++#define SWAPIN_SLOT_CAPTURE_SIZE	(30 * 1024 * 1024)
++
++struct swapin_slot_capture_entry {
++	u64 vaddr;
++	u64 swap_offset;
++	u64 ra_win_id;
++};
++
++static DEFINE_SPINLOCK(swapin_slot_capture_lock);
++static struct swapin_slot_capture_entry *swapin_slot_capture_buf;
++static size_t swapin_slot_capture_count;
++static bool swapin_slot_capture_enabled __read_mostly;
++static atomic64_t swapin_slot_ra_win_id = ATOMIC64_INIT(0);
++
++#define SWAPOUT_SLOT_ORDER_LOG_SIZE	SWAPIN_SLOT_CAPTURE_SIZE
++
++struct swapout_slot_order_log_entry {
++	u64 order;
++	u64 swapout_order;
++};
++
++static DEFINE_SPINLOCK(swapout_slot_order_log_lock);
++static struct swapout_slot_order_log_entry *swapout_slot_order_log_buf;
++static size_t swapout_slot_order_log_count;
++static bool swapout_slot_order_log_enabled __read_mostly;
++static atomic64_t swapout_slot_order_read_next = ATOMIC64_INIT(0);
++
++static size_t swapin_slot_capture_capacity(void)
++{
++	return SWAPIN_SLOT_CAPTURE_SIZE / sizeof(struct swapin_slot_capture_entry);
++}
++
++static size_t swapout_slot_order_log_capacity(void)
++{
++	return SWAPOUT_SLOT_ORDER_LOG_SIZE /
++		sizeof(struct swapout_slot_order_log_entry);
++}
++
++void swapin_slot_capture_record(struct page *page, unsigned long addr,
++				u64 ra_win_id)
++{
++	unsigned long flags;
++	struct swapin_slot_capture_entry *entry;
++	u64 swap_offset;
++
++	if (!READ_ONCE(swapin_slot_capture_enabled))
++		return;
++
++	swap_offset = swap_page_sector(page);
++
++	spin_lock_irqsave(&swapin_slot_capture_lock, flags);
++	if (!swapin_slot_capture_enabled || !swapin_slot_capture_buf ||
++	    swapin_slot_capture_count >= swapin_slot_capture_capacity())
++		goto out;
++
++	entry = &swapin_slot_capture_buf[swapin_slot_capture_count++];
++	entry->vaddr = addr & PAGE_MASK;
++	entry->swap_offset = swap_offset;
++	entry->ra_win_id = ra_win_id;
++out:
++	spin_unlock_irqrestore(&swapin_slot_capture_lock, flags);
++}
++
++void swapout_slot_order_capture_record(swp_entry_t entry)
++{
++	unsigned long flags;
++	struct swapout_slot_order_log_entry *log_entry;
++	u64 swapout_order;
++
++	if (!READ_ONCE(swapout_slot_order_log_enabled))
++		return;
++
++	swapout_order = swapout_slot_order_lookup(entry);
++
++	spin_lock_irqsave(&swapout_slot_order_log_lock, flags);
++	if (!swapout_slot_order_log_enabled || !swapout_slot_order_log_buf ||
++	    swapout_slot_order_log_count >= swapout_slot_order_log_capacity())
++		goto out;
++
++	log_entry = &swapout_slot_order_log_buf[swapout_slot_order_log_count++];
++	log_entry->order = atomic64_inc_return(&swapout_slot_order_read_next);
++	log_entry->swapout_order = swapout_order;
++out:
++	spin_unlock_irqrestore(&swapout_slot_order_log_lock, flags);
++}
++
+ void show_swap_cache_info(void)
+ {
+ 	printk("%lu pages in swap cache\n", total_swapcache_pages());
+@@ -543,8 +631,10 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 	struct page *retpage = __read_swap_cache_async(entry, gfp_mask,
+ 			vma, addr, &page_was_allocated);
+ 
+-	if (page_was_allocated)
++	if (page_was_allocated) {
++		swapin_slot_capture_record(retpage, addr, 0);
+ 		swap_readpage(retpage, false, plug);
++	}
+ 
+ 	return retpage;
+ }
+@@ -802,6 +892,7 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+ 	swp_entry_t entry;
+ 	unsigned int i;
+ 	bool page_allocated;
++	u64 ra_win_id = 0;
+ 	struct vma_swap_readahead ra_info = {
+ 		.win = 1,
+ 	};
+@@ -810,6 +901,10 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+ 	if (ra_info.win == 1)
+ 		goto skip;
+ 
++	ra_win_id = atomic64_inc_return(&swapin_slot_ra_win_id);
++	if (!ra_win_id)
++		ra_win_id = atomic64_inc_return(&swapin_slot_ra_win_id);
++
+ 	addr = vmf->address - (ra_info.offset * PAGE_SIZE);
+ 
+ 	blk_start_plug(&plug);
+@@ -832,6 +927,7 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+ 		if (!page)
+ 			continue;
+ 		if (page_allocated) {
++			swapin_slot_capture_record(page, addr, ra_win_id);
+ 			swap_readpage(page, false, &splug);
+ 			if (i != ra_info.offset) {
+ 				SetPageReadahead(page);
+@@ -851,6 +947,140 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+ 				     NULL);
+ }
+ 
++//zest-vra: ZEST-private VMA readahead front-end. When ZEST owns readahead for
++//@fentry's swapfile (zest_swap_ra_win() > 0), this REPLACES the kernel's
++//vma/cluster readahead: collect the VMA-neighbor swap slots around the fault
++//(the same lockless PTE walk swap_vma_readahead does, clamped to the VMA and
++//the fault's PMD so one pte_offset_map covers it), hand them to the ZEST
++//prefetch engine (async, off the critical path), and read ONLY the faulting
++//page here. Returns NULL when not active -> caller falls through to the
++//kernel readahead. NOTE: read_swap_cache_async() can return NULL under
++//memory pressure; we also return NULL then and the kernel path below retries
++//the read -- a rare, harmless double attempt (the prefetch hint stands).
++//
++//M3 adaptive window: this is swap_ra_info()'s algorithm verbatim -- the same
++//vma->swap_readahead_info <addr, win, hits> triple and the same
++//__swapin_nr_pages() slope -- with two substitutions:
++//  - max_win comes from the vra_win knob, NOT page_cluster (the test baseline
++//    runs page-cluster=0, which must kill the KERNEL's readahead, not ours);
++//  - hit attribution: the kernel credits `hits` when a fault finds a
++//    PG_readahead page in the swap cache; our prefetched pages live in the
++//    ZEST-private read cache instead, so we probe it (zest_swap_ra_peek). A
++//    peek hit means prefetch predicted this fault: credit it, KEEP the
++//    current window, and skip re-collection -- exactly like the kernel, a new
++//    round is only issued by the fault that falls OUT of the prefetched
++//    window. (Bonus: no re-enqueue of the overlapping window = no fill_dups
++//    flood.) The probe also returns true for an in-flight fill: prediction
++//    was right, merely late -- lateness is judged separately (rc_late_fills).
++static struct page *zest_swapin_readahead(swp_entry_t fentry, gfp_t gfp_mask,
++					  struct vm_fault *vmf)
++{
++	struct vm_area_struct *vma = vmf->vma;
++	struct swap_info_struct *sis = swp_swap_info(fentry);
++	u32 slots[ZEST_SWAP_RA_WIN_MAX];
++	unsigned int max_win, win, hits, prev_win, n = 0, i, nr;
++	unsigned long ra_val, faddr, fpfn, pfn, lpfn, rpfn, start, end;
++	pte_t *pte, pentry;
++	swp_entry_t entry;
++
++	max_win = zest_swap_ra_win(sis);
++	if (!max_win)
++		return NULL;
++	if (!vma || !vmf->pmd)
++		return NULL;
++
++	faddr = vmf->address;
++	fpfn  = PFN_DOWN(faddr);
++	ra_val   = GET_SWAP_RA_VAL(vma);
++	pfn      = PFN_DOWN(SWAP_RA_ADDR(ra_val));
++	prev_win = SWAP_RA_WIN(ra_val);
++	hits     = SWAP_RA_HITS(ra_val);
++
++	if (zest_swap_ra_peek(sis, (u32)swp_offset(fentry))) {
++		hits = min_t(unsigned int, hits + 1, SWAP_RA_HITS_MAX);
++		atomic_long_set(&vma->swap_readahead_info,
++				SWAP_RA_VAL(faddr, prev_win, hits));
++		goto fault_read;
++	}
++
++	win = __swapin_nr_pages(pfn, fpfn, hits, max_win, prev_win);
++	//zest-vra (M3.6): asymmetric aggression on top of the Linux slope.
++	//jump: this round ended a CONFIRMED streak (>= vra_jump peek hits) --
++	//skip the doubling ladder and open the next window at the cap; rounds
++	//with hits==0 (the singleton majority) never trigger it. min: blunt
++	//floor for sweeping the precision<->coverage curve. Applied before the
++	//ra_val/stat writeback so prev_win and the histogram see the real
++	//window (the don't-shrink-fast rule then decays from the boosted
++	//value, as intended).
++	{
++		unsigned int knob = zest_swap_ra_jump();
++
++		if (knob && hits >= knob)
++			win = max_win;
++		knob = zest_swap_ra_min();
++		if (knob && win < knob)
++			win = min_t(unsigned int, knob, max_win);
++	}
++	atomic_long_set(&vma->swap_readahead_info,
++			SWAP_RA_VAL(faddr, win, 0));
++	zest_swap_ra_stat_win(sis, win);
++	if (win == 1)
++		goto fault_read;
++
++	//Window placement: swap_ra_info()'s forward / backward / centered
++	//split, clamped to the VMA and to faddr's PMD. The explicit underflow
++	//guards matter for tiny fault addresses: fpfn - x would wrap and max3()
++	//would then pick the wrapped huge value. rpfn stays relative to fpfn
++	//(not to the clamped lpfn) so the window never silently shifts right.
++	if (fpfn == pfn + 1) {			/* sequential forward */
++		lpfn = fpfn;
++		rpfn = fpfn + win;
++	} else if (pfn == fpfn + 1) {		/* sequential backward */
++		lpfn = fpfn >= win - 1 ? fpfn - (win - 1) : 0;
++		rpfn = fpfn + 1;
++	} else {				/* no direction: centered */
++		unsigned int left = (win - 1) / 2;
++
++		lpfn = fpfn > left ? fpfn - left : 0;
++		rpfn = fpfn + (win - left);
++	}
++	start = max3(lpfn, PFN_DOWN(vma->vm_start),
++		     PFN_DOWN(faddr & PMD_MASK));
++	end   = min3(rpfn, PFN_DOWN(vma->vm_end),
++		     PFN_DOWN((faddr & PMD_MASK) + PMD_SIZE));
++
++	if (end > start) {
++		nr = end - start;
++		pte = pte_offset_map(vmf->pmd, start << PAGE_SHIFT);
++		if (pte) {
++			for (i = 0; i < nr; i++) {
++				pentry = ptep_get_lockless(pte + i);
++				if (!is_swap_pte(pentry))
++					continue;
++				entry = pte_to_swp_entry(pentry);
++				if (unlikely(non_swap_entry(entry)))
++					continue;
++				//Same swapfile only (the engine is per-device)
++				//and never the faulting page itself (its read
++				//is issued below, not prefetched).
++				if (swp_type(entry) != swp_type(fentry))
++					continue;
++				if (swp_offset(entry) == swp_offset(fentry))
++					continue;
++				slots[n++] = (u32)swp_offset(entry);
++			}
++			pte_unmap(pte);
++		}
++	}
++	if (n)
++		zest_swap_ra_submit(sis, slots, n);
++
++fault_read:
++	/* The faulting page itself: plain swap-cache read, no kernel RA. */
++	return read_swap_cache_async(fentry, gfp_mask, vma, vmf->address,
++				     NULL);
++}
++
+ /**
+  * swapin_readahead - swap in pages in hope we need them soon
+  * @entry: swap entry of this memory
+@@ -866,12 +1096,231 @@ static struct page *swap_vma_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 				struct vm_fault *vmf)
+ {
++	//zest-vra: ZEST takes over readahead for its swapfile (collect VMA
++	//neighbors -> async prefetch into the ZEST read cache, fault page read
++	//inline). Non-ZEST entries (and NULL = not handled) fall through.
++	struct page *page = zest_swapin_readahead(entry, gfp_mask, vmf);
++
++	if (page)
++		return page;
+ 	return swap_use_vma_readahead() ?
+ 			swap_vma_readahead(entry, gfp_mask, vmf) :
+ 			swap_cluster_readahead(entry, gfp_mask, vmf);
+ }
+ 
+ #ifdef CONFIG_SYSFS
++
++static ssize_t swapin_slot_capture_show(struct kobject *kobj,
++					struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n",
++			  READ_ONCE(swapin_slot_capture_enabled) ? "true" : "false");
++}
++
++static ssize_t swapin_slot_capture_store(struct kobject *kobj,
++					 struct kobj_attribute *attr,
++					 const char *buf, size_t count)
++{
++	struct swapin_slot_capture_entry *new_buf = NULL, *old_buf = NULL;
++	unsigned long flags;
++	bool enabled;
++	ssize_t ret;
++
++	ret = kstrtobool(buf, &enabled);
++	if (ret)
++		return ret;
++
++	if (enabled && !READ_ONCE(swapin_slot_capture_buf)) {
++		new_buf = vzalloc(SWAPIN_SLOT_CAPTURE_SIZE);
++		if (!new_buf)
++			return -ENOMEM;
++	}
++
++	spin_lock_irqsave(&swapin_slot_capture_lock, flags);
++	if (enabled) {
++		if (!swapin_slot_capture_buf) {
++			swapin_slot_capture_buf = new_buf;
++			new_buf = NULL;
++		}
++		swapin_slot_capture_count = 0;
++		WRITE_ONCE(swapin_slot_capture_enabled, true);
++	} else {
++		WRITE_ONCE(swapin_slot_capture_enabled, false);
++		old_buf = swapin_slot_capture_buf;
++		swapin_slot_capture_buf = NULL;
++		swapin_slot_capture_count = 0;
++	}
++	spin_unlock_irqrestore(&swapin_slot_capture_lock, flags);
++
++	vfree(new_buf);
++	vfree(old_buf);
++	return count;
++}
++static struct kobj_attribute swapin_slot_capture_attr =
++	__ATTR_RW(swapin_slot_capture);
++
++static ssize_t swapin_slot_log_read(struct file *file, struct kobject *kobj,
++				    struct bin_attribute *attr, char *buf,
++				    loff_t off, size_t count)
++{
++	unsigned long flags;
++	size_t bytes = 0;
++	size_t pos;
++	size_t used;
++
++	if (off < 0)
++		return 0;
++	pos = off;
++
++	spin_lock_irqsave(&swapin_slot_capture_lock, flags);
++	used = swapin_slot_capture_count *
++		sizeof(struct swapin_slot_capture_entry);
++	if (swapin_slot_capture_buf && pos < used) {
++		bytes = min_t(size_t, count, used - pos);
++		memcpy(buf, (char *)swapin_slot_capture_buf + pos, bytes);
++	}
++	spin_unlock_irqrestore(&swapin_slot_capture_lock, flags);
++
++	return bytes;
++}
++
++static struct bin_attribute swapin_slot_log_attr = {
++	.attr = {
++		.name = "swapin_slot_log",
++		.mode = 0444,
++	},
++	.size = SWAPIN_SLOT_CAPTURE_SIZE,
++	.read = swapin_slot_log_read,
++};
++
++static ssize_t swapout_slot_order_capture_show(struct kobject *kobj,
++					       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n",
++			  READ_ONCE(swapout_slot_order_log_enabled) ?
++			  "true" : "false");
++}
++
++static ssize_t swapout_slot_order_capture_store(struct kobject *kobj,
++						struct kobj_attribute *attr,
++						const char *buf, size_t count)
++{
++	struct swapout_slot_order_log_entry *new_buf = NULL, *old_buf = NULL;
++	unsigned long flags;
++	bool enabled;
++	ssize_t ret;
++
++	ret = kstrtobool(buf, &enabled);
++	if (ret)
++		return ret;
++
++	if (enabled && !READ_ONCE(swapout_slot_order_log_buf)) {
++		new_buf = vzalloc(SWAPOUT_SLOT_ORDER_LOG_SIZE);
++		if (!new_buf)
++			return -ENOMEM;
++	}
++
++	spin_lock_irqsave(&swapout_slot_order_log_lock, flags);
++	if (enabled) {
++		if (!swapout_slot_order_log_buf) {
++			swapout_slot_order_log_buf = new_buf;
++			new_buf = NULL;
++		}
++		swapout_slot_order_log_count = 0;
++		atomic64_set(&swapout_slot_order_read_next, 0);
++		WRITE_ONCE(swapout_slot_order_log_enabled, true);
++	} else {
++		WRITE_ONCE(swapout_slot_order_log_enabled, false);
++		old_buf = swapout_slot_order_log_buf;
++		swapout_slot_order_log_buf = NULL;
++		swapout_slot_order_log_count = 0;
++	}
++	spin_unlock_irqrestore(&swapout_slot_order_log_lock, flags);
++
++	swapout_slot_order_tracking_set(enabled);
++	vfree(new_buf);
++	vfree(old_buf);
++	return count;
++}
++static struct kobj_attribute swapout_slot_order_capture_attr =
++	__ATTR_RW(swapout_slot_order_capture);
++
++static ssize_t swap_slot_reread_monitor_show(struct kobject *kobj,
++					     struct kobj_attribute *attr,
++					     char *buf)
++{
++	struct swap_slot_reread_monitor_stats stats;
++	u64 probability_ppm = 0;
++
++	swap_slot_reread_monitor_get_stats(&stats);
++	if (stats.total_io_reads)
++		probability_ppm = mul_u64_u64_div_u64(stats.repeated_io_reads,
++							1000000ULL,
++							stats.total_io_reads);
++
++	return sysfs_emit(buf,
++			  "enabled=%s total_io_reads=%llu repeated_io_reads=%llu probability_ppm=%llu freed_read_slots=%llu freed_repeated_slots=%llu\n",
++			  stats.enabled ? "true" : "false",
++			  stats.total_io_reads, stats.repeated_io_reads,
++			  probability_ppm, stats.freed_read_slots,
++			  stats.freed_repeated_slots);
++}
++
++static ssize_t swap_slot_reread_monitor_store(struct kobject *kobj,
++					      struct kobj_attribute *attr,
++					      const char *buf, size_t count)
++{
++	bool enabled;
++	ssize_t ret;
++
++	ret = kstrtobool(buf, &enabled);
++	if (ret)
++		return ret;
++
++	ret = swap_slot_reread_monitor_set(enabled);
++	if (ret)
++		return ret;
++
++	return count;
++}
++static struct kobj_attribute swap_slot_reread_monitor_attr =
++	__ATTR_RW(swap_slot_reread_monitor);
++
++static ssize_t swapout_slot_order_log_read(struct file *file,
++					   struct kobject *kobj,
++					   struct bin_attribute *attr, char *buf,
++					   loff_t off, size_t count)
++{
++	unsigned long flags;
++	size_t bytes = 0;
++	size_t pos;
++	size_t used;
++
++	if (off < 0)
++		return 0;
++	pos = off;
++
++	spin_lock_irqsave(&swapout_slot_order_log_lock, flags);
++	used = swapout_slot_order_log_count *
++		sizeof(struct swapout_slot_order_log_entry);
++	if (swapout_slot_order_log_buf && pos < used) {
++		bytes = min_t(size_t, count, used - pos);
++		memcpy(buf, (char *)swapout_slot_order_log_buf + pos, bytes);
++	}
++	spin_unlock_irqrestore(&swapout_slot_order_log_lock, flags);
++
++	return bytes;
++}
++
++static struct bin_attribute swapout_slot_order_log_attr = {
++	.attr = {
++		.name = "swapout_slot_order_log",
++		.mode = 0444,
++	},
++	.size = SWAPOUT_SLOT_ORDER_LOG_SIZE,
++	.read = swapout_slot_order_log_read,
++};
++
+ static ssize_t vma_ra_enabled_show(struct kobject *kobj,
+ 				     struct kobj_attribute *attr, char *buf)
+ {
+@@ -894,11 +1343,21 @@ static struct kobj_attribute vma_ra_enabled_attr = __ATTR_RW(vma_ra_enabled);
+ 
+ static struct attribute *swap_attrs[] = {
+ 	&vma_ra_enabled_attr.attr,
++	&swapin_slot_capture_attr.attr,
++	&swapout_slot_order_capture_attr.attr,
++	&swap_slot_reread_monitor_attr.attr,
++	NULL,
++};
++
++static struct bin_attribute *swap_bin_attrs[] = {
++	&swapin_slot_log_attr,
++	&swapout_slot_order_log_attr,
+ 	NULL,
+ };
+ 
+ static const struct attribute_group swap_attr_group = {
+ 	.attrs = swap_attrs,
++	.bin_attrs = swap_bin_attrs,
+ };
+ 
+ static int __init swap_init_sysfs(void)
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 5a8c7cd45dfc..2b3ecaf67c7b 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -43,6 +43,8 @@
+ #include <linux/suspend.h>
+ #include <linux/zswap.h>
+ #include <linux/page_size_compat.h>
++#include <linux/zest.h>
++#include <linux/limits.h>
+ 
+ #include <asm/tlbflush.h>
+ #include <linux/swapops.h>
+@@ -109,7 +111,197 @@ static DEFINE_SPINLOCK(swap_avail_lock);
+ 
+ static struct swap_info_struct *swap_info[MAX_SWAPFILES];
+ 
++struct swap_slot_reread_monitor_area {
++	u32 *read_counts;
++	unsigned long nr_slots;
++};
++
++static DEFINE_SPINLOCK(swap_slot_reread_monitor_lock);
++static struct swap_slot_reread_monitor_area
++	swap_slot_reread_monitor_areas[MAX_SWAPFILES];
++static bool swap_slot_reread_monitor_enabled __read_mostly;
++static u64 swap_slot_reread_monitor_total_io_reads;
++static u64 swap_slot_reread_monitor_repeated_io_reads;
++static u64 swap_slot_reread_monitor_freed_read_slots;
++static u64 swap_slot_reread_monitor_freed_repeated_slots;
++
++static void swap_slot_reread_monitor_reset_locked(void)
++{
++	int type;
++
++	swap_slot_reread_monitor_total_io_reads = 0;
++	swap_slot_reread_monitor_repeated_io_reads = 0;
++	swap_slot_reread_monitor_freed_read_slots = 0;
++	swap_slot_reread_monitor_freed_repeated_slots = 0;
++
++	for (type = 0; type < MAX_SWAPFILES; type++) {
++		struct swap_slot_reread_monitor_area *area =
++			&swap_slot_reread_monitor_areas[type];
++
++		if (area->read_counts && area->nr_slots)
++			memset(area->read_counts, 0,
++			       area->nr_slots * sizeof(*area->read_counts));
++	}
++}
++
++int swap_slot_reread_monitor_set(bool enabled)
++{
++	unsigned long nr_slots[MAX_SWAPFILES] = {};
++	u32 *new_counts[MAX_SWAPFILES] = {};
++	u32 *old_counts[MAX_SWAPFILES] = {};
++	unsigned long flags;
++	int type;
++	int ret = 0;
++
++	if (enabled) {
++		spin_lock(&swap_lock);
++		for (type = 0; type < nr_swapfiles; type++) {
++			struct swap_info_struct *si = swap_info[type];
++
++			if (si && (si->flags & SWP_USED))
++				nr_slots[type] = si->max;
++		}
++		spin_unlock(&swap_lock);
++
++		for (type = 0; type < MAX_SWAPFILES; type++) {
++			if (!nr_slots[type])
++				continue;
++
++			new_counts[type] = vzalloc(array_size(nr_slots[type],
++							      sizeof(*new_counts[type])));
++			if (!new_counts[type]) {
++				ret = -ENOMEM;
++				goto out_free_new;
++			}
++		}
++	}
++
++	spin_lock(&swap_lock);
++	spin_lock_irqsave(&swap_slot_reread_monitor_lock, flags);
++	if (enabled) {
++		for (type = 0; type < MAX_SWAPFILES; type++) {
++			struct swap_info_struct *si = swap_info[type];
++			struct swap_slot_reread_monitor_area *area =
++				&swap_slot_reread_monitor_areas[type];
++
++			if (!si || !(si->flags & SWP_USED) || !nr_slots[type])
++				continue;
++			if (area->read_counts)
++				continue;
++
++			area->read_counts = new_counts[type];
++			area->nr_slots = nr_slots[type];
++			new_counts[type] = NULL;
++		}
++		swap_slot_reread_monitor_reset_locked();
++		WRITE_ONCE(swap_slot_reread_monitor_enabled, true);
++	} else {
++		WRITE_ONCE(swap_slot_reread_monitor_enabled, false);
++		for (type = 0; type < MAX_SWAPFILES; type++) {
++			struct swap_slot_reread_monitor_area *area =
++				&swap_slot_reread_monitor_areas[type];
++
++			old_counts[type] = area->read_counts;
++			area->read_counts = NULL;
++			area->nr_slots = 0;
++		}
++		swap_slot_reread_monitor_reset_locked();
++	}
++	spin_unlock_irqrestore(&swap_slot_reread_monitor_lock, flags);
++	spin_unlock(&swap_lock);
++
++out_free_new:
++	for (type = 0; type < MAX_SWAPFILES; type++) {
++		vfree(new_counts[type]);
++		vfree(old_counts[type]);
++	}
++
++	return ret;
++}
++
++void swap_slot_reread_monitor_get_stats(
++		struct swap_slot_reread_monitor_stats *stats)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&swap_slot_reread_monitor_lock, flags);
++	stats->enabled = swap_slot_reread_monitor_enabled;
++	stats->total_io_reads = swap_slot_reread_monitor_total_io_reads;
++	stats->repeated_io_reads = swap_slot_reread_monitor_repeated_io_reads;
++	stats->freed_read_slots = swap_slot_reread_monitor_freed_read_slots;
++	stats->freed_repeated_slots =
++		swap_slot_reread_monitor_freed_repeated_slots;
++	spin_unlock_irqrestore(&swap_slot_reread_monitor_lock, flags);
++}
++
++void swap_slot_reread_monitor_read(swp_entry_t entry)
++{
++	struct swap_slot_reread_monitor_area *area;
++	unsigned long flags;
++	unsigned long offset = swp_offset(entry);
++	int type = swp_type(entry);
++	u32 count;
++
++	if (!READ_ONCE(swap_slot_reread_monitor_enabled))
++		return;
++	if (type >= MAX_SWAPFILES)
++		return;
++
++	spin_lock_irqsave(&swap_slot_reread_monitor_lock, flags);
++	if (!swap_slot_reread_monitor_enabled)
++		goto out;
++
++	area = &swap_slot_reread_monitor_areas[type];
++	if (!area->read_counts || offset >= area->nr_slots)
++		goto out;
++
++	count = area->read_counts[offset];
++	if (count)
++		swap_slot_reread_monitor_repeated_io_reads++;
++	if (count != U32_MAX)
++		area->read_counts[offset] = count + 1;
++	swap_slot_reread_monitor_total_io_reads++;
++out:
++	spin_unlock_irqrestore(&swap_slot_reread_monitor_lock, flags);
++}
++
++void swap_slot_reread_monitor_free(struct swap_info_struct *si,
++				   unsigned long offset,
++				   unsigned int nr_entries)
++{
++	struct swap_slot_reread_monitor_area *area;
++	unsigned long flags;
++	unsigned long end = offset + nr_entries;
++
++	if (!READ_ONCE(swap_slot_reread_monitor_enabled))
++		return;
++
++	spin_lock_irqsave(&swap_slot_reread_monitor_lock, flags);
++	if (!swap_slot_reread_monitor_enabled)
++		goto out;
++
++	area = &swap_slot_reread_monitor_areas[si->type];
++	if (!area->read_counts || offset >= area->nr_slots)
++		goto out;
++
++	end = min(end, area->nr_slots);
++	while (offset < end) {
++		u32 count = area->read_counts[offset];
++
++		if (count) {
++			swap_slot_reread_monitor_freed_read_slots++;
++			if (count > 1)
++				swap_slot_reread_monitor_freed_repeated_slots++;
++			area->read_counts[offset] = 0;
++		}
++		offset++;
++	}
++out:
++	spin_unlock_irqrestore(&swap_slot_reread_monitor_lock, flags);
++}
++
+ struct swap_info_ext {
++	u64 *slot_order_map;			/* per-slot swapout batch order */
+ 	struct list_head frag_clusters[SWAP_NR_ORDERS];
+ 					/* list of cluster that are fragmented or contented */
+ 	unsigned int frag_cluster_nr[SWAP_NR_ORDERS];
+@@ -131,6 +323,8 @@ static inline struct swap_info_struct *to_swap_info_struct(struct swap_info_ext
+ }
+ 
+ static DEFINE_MUTEX(swapon_mutex);
++static atomic64_t swapout_slot_order_next = ATOMIC64_INIT(0);
++static bool swapout_slot_order_tracking __read_mostly;
+ 
+ static DECLARE_WAIT_QUEUE_HEAD(proc_poll_wait);
+ /* Activity counter to indicate that a swapon or swapoff has occurred */
+@@ -347,6 +541,54 @@ offset_to_swap_extent(struct swap_info_struct *sis, unsigned long offset)
+ 	BUG();
+ }
+ 
++bool swapout_slot_order_tracking_enabled(void)
++{
++	return READ_ONCE(swapout_slot_order_tracking);
++}
++
++void swapout_slot_order_tracking_set(bool enabled)
++{
++	WRITE_ONCE(swapout_slot_order_tracking, enabled);
++}
++
++void swapout_slot_order_record(struct page *page)
++{
++	struct folio *folio = page_folio(page);
++	struct swap_info_struct *sis = page_swap_info(page);
++	struct swap_info_ext *sie = to_swap_info_ext(sis);
++	unsigned long offset = swp_offset(folio->swap);
++	unsigned int nr_pages = folio_nr_pages(folio);
++	u64 order;
++	unsigned int i;
++
++	if (!READ_ONCE(swapout_slot_order_tracking))
++		return;
++	if (!sie || !READ_ONCE(sie->slot_order_map))
++		return;
++	if (offset >= sis->max)
++		return;
++
++	nr_pages = min_t(unsigned int, nr_pages, sis->max - offset);
++	order = atomic64_inc_return(&swapout_slot_order_next);
++	for (i = 0; i < nr_pages; i++)
++		WRITE_ONCE(sie->slot_order_map[offset + i], order);
++}
++
++u64 swapout_slot_order_lookup(swp_entry_t entry)
++{
++	struct swap_info_struct *sis = swp_swap_info(entry);
++	struct swap_info_ext *sie;
++	unsigned long offset = swp_offset(entry);
++
++	if (!sis || offset >= sis->max)
++		return 0;
++	sie = to_swap_info_ext(sis);
++	if (!sie || !READ_ONCE(sie->slot_order_map))
++		return 0;
++
++	return READ_ONCE(sie->slot_order_map[offset]);
++}
++
+ sector_t swap_page_sector(struct page *page)
+ {
+ 	struct swap_info_struct *sis = page_swap_info(page);
+@@ -963,6 +1205,10 @@ static void swap_range_alloc(struct swap_info_struct *si, unsigned long offset,
+ 	struct swap_info_ext *sie = to_swap_info_ext(si);
+ 	unsigned int end = offset + nr_entries - 1;
+ 
++	if (sie->slot_order_map)
++		memset(sie->slot_order_map + offset, 0,
++		       nr_entries * sizeof(*sie->slot_order_map));
++
+ 	if (offset == si->lowest_bit)
+ 		si->lowest_bit += nr_entries;
+ 	if (end == si->highest_bit)
+@@ -1019,6 +1265,14 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
+ 		offset++;
+ 	}
+ 	clear_shadow_from_swap_cache(si->type, begin, end);
++
++	//zest-gc: tell ZEST the slots are freed so it can drop the L2P/rmap
++	//entries and keep per-zone valid_blocks exact for GC victim selection.
++	//Atomic context (si->lock held) -- the hook takes only a spinlock.
++	if (zest_should_intercept(si))
++		zest_swap_slot_free(si, begin, nr_entries);
++
++	swap_slot_reread_monitor_free(si, begin, nr_entries);
+ }
+ 
+ static void set_cluster_next(struct swap_info_struct *si, unsigned long next)
+@@ -2913,6 +3167,8 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ 	free_percpu(p->cluster_next_cpu);
+ 	p->cluster_next_cpu = NULL;
+ 	vfree(swap_map);
++	vfree(sie->slot_order_map);
++	sie->slot_order_map = NULL;
+ 	kvfree(cluster_info);
+ 	/* Destroy swap account information */
+ 	swap_cgroup_swapoff(p->type);
+@@ -3491,6 +3747,17 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 		goto bad_swap_unlock_inode;
+ 	}
+ 
++	vfree(sie->slot_order_map);
++	sie->slot_order_map = NULL;
++	if (swapout_slot_order_tracking_enabled()) {
++		sie->slot_order_map = vzalloc(array_size(maxpages,
++							sizeof(*sie->slot_order_map)));
++		if (!sie->slot_order_map) {
++			error = -ENOMEM;
++			goto bad_swap_unlock_inode;
++		}
++	}
++
+ 	if (p->bdev && bdev_stable_writes(p->bdev))
+ 		p->flags |= SWP_STABLE_WRITES;
+ 
+@@ -3664,6 +3931,8 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 	p->flags = 0;
+ 	spin_unlock(&swap_lock);
+ 	vfree(swap_map);
++	vfree(sie->slot_order_map);
++	sie->slot_order_map = NULL;
+ 	kvfree(cluster_info);
+ 	if (inced_nr_rotate_swap)
+ 		atomic_dec(&nr_rotate_swap);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index b2e6f98e2932..94891d04c35c 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -62,6 +62,7 @@
+ #include <asm/div64.h>
+ 
+ #include <linux/swapops.h>
++#include <linux/zest.h>
+ #include <linux/balloon_compaction.h>
+ #include <linux/sched/sysctl.h>
+ 
+@@ -2245,8 +2246,13 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+ 		}
+ activate_locked:
+ 		/* Not a candidate for swapping, so reclaim swap space. */
++		//zest-znswap: keep mlocked trimming, but suppress the
++		//vm_swap_full()-driven trim for ZEST-backed pages with zone
++		//headroom (clean copy stays valid on device -> no rewrite later).
+ 		if (folio_test_swapcache(folio) &&
+-		    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))
++		    (folio_test_mlocked(folio) ||
++		     (mem_cgroup_swap_full(folio) &&
++		      !zest_swap_retain_cache(folio))))
+ 			folio_free_swap(folio);
+ 		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
+ 		if (!folio_test_mlocked(folio)) {
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index bfea0422afe4..aed956cbc64d 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1358,7 +1358,7 @@ const char * const vmstat_text[] = {
+ 	"thp_split_page",
+ 	"thp_split_page_failed",
+ 	"thp_deferred_split_page",
+-	"thp_underused_split_page",
++	// "thp_underused_split_page", //zest1 to enable swap_ra_hit
+ 	"thp_split_pmd",
+ 	"thp_shatter_page",
+ 	"thp_shatter_page_failed",
