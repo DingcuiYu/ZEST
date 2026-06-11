@@ -83,4 +83,4 @@ Verify that `git status` shows a clean state.
 
 **2. Experimental read optimizations**
 
-The provided patch retains some read optimization experiments we attempted (read cache, reorder, etc.). Unfortunately, they are not mature enough and introduce side effects, so they are included here for reference only.
+The provided patch retains some read optimization experiments I attempted (read cache, reorder, etc.). Unfortunately, they are not mature enough and introduce side effects, so they are included here for reference only.
