@@ -221,6 +221,3 @@ motivation experiment in the paper.
 | Average startup time | 307.2 ms |  407.9 ms | 449.05 ms | 430 ms |
 | WAF |  1.062 | 1.110 | 1.087 | 1.048 |
 | Cache hit ratio |  80.7% | 89.9% | 94.0% | 96.7% |
-
-The baseline column has no WAF or cache-hit-ratio value because those metrics
-were reported only for the four chunk-group sizes.
