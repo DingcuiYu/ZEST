@@ -1,0 +1,45 @@
+1. Enter the debugfs directory
+adb root
+adb shell
+cd /sys/kernel/debug/swap_lifecycle_trace/
+ls
+# enable  buffer_size_mb  reset  log  format
+
+(Optional) cat format lets you directly view a human-readable description of the fields/events, for checking the ABI.
+
+2.(Optional) Set the buffer size
+The default is 256MB (about 1.4 million records, 192B each), range 1-4096MB:
+echo 512 > buffer_size_mb
+
+Note: This can only be changed when no collection is in progress and no one is currently reading log; if you have already run a round and the current buffer size is different from what you want to set, it will return EBUSY. You need to first echo 1 > reset to release the old buffer before changing it.
+
+3. Start collection
+echo 1 > enable
+
+This will allocate/reuse the buffer, clear all counters to zero, increment the session number, and start recording ALLOC/VMA_BIND/SWAPOUT/SWAPIN_FAULT/SWAPIN_IO/FREE/DISCARD.
+
+4. Run your test scenario
+
+5. Stop collection
+echo 0 > enable
+
+When stopping, it traverses all still-live (not freed) slots and emits an additional ALIVE record for each. This is the necessary step for the coverage identity ALLOC == FREE+ALIVE to close. Opening the log file while enable=1 returns EBUSY directly, so you must stop first before reading.
+
+6. Export the log
+cat /sys/kernel/debug/swap_lifecycle_trace/log > /data/local/tmp/swlc.bin
+exit
+adb pull /data/local/tmp/swlc.bin
+
+7. Offline analysis
+python3 analyze_swap_lifecycle.py swlc.bin
+# Add --dump to print record by record, add --summary-csv out.csv to export lifecycle statistics by uid
+
+Focus on the == coverage validation == section in the output:
+Whether stale_meta is 0 - if it is not 0, it means there are still kernel free paths not hooked, and it will directly list the first batch of hit swap_entry values to help you trace them in the kernel.
+dropped_full - whether the buffer was filled (if full, increase buffer_size_mb and rerun).
+free_no_meta - the number of slots that were already allocated before the session started and whose ALLOC cannot be seen this time; some are expected and it is not considered abnormal.
+Whether ALLOC(OK-ish) is equal to FREE(meta)+ALIVE.
+
+Analyze write amplification:
+python3 simulate_gc.py candycrushsaga_swap_lifecycle.raw --models block,zufs,zufs-name
+--data-zones 8 --op-zones 3 -o result.json
